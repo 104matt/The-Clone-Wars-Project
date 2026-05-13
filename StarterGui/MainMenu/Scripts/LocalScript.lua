@@ -13,8 +13,8 @@ local RunService         = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 -- Durate
-local SCREEN_FADE_OUT_TIME = 0.35
-local SCREEN_FADE_IN_TIME  = 0.60
+local SCREEN_WIPE_TIME     = 1.20 -- Tempo per traslare il frame nero
+local WIPE_STAY_TIME       = 3.00 -- Tempo che resta tutto nero per coprire il TP
 local POST_REMOTE_DELAY    = 0.10
 local DEBUG = true
 local function dprint(...) if DEBUG then print("[MainMenuClient]", ...) end end
@@ -172,7 +172,11 @@ local function createSelectionController(buttons, options)
 	local strokeActive   = options.strokeActive   or Color3.new(1,1,1)
 	local scale          = options.scale or 1.08
 	local useStroke      = options.useStroke
+	local swapImages     = options.swapImages
 	local origSizes = {}
+
+	local INACTIVE_IMAGE = "rbxassetid://87512940488124"
+	local ACTIVE_IMAGE   = "rbxassetid://88430487436710"
 
 	for _, b in ipairs(buttons) do
 		origSizes[b] = b.Size
@@ -184,12 +188,37 @@ local function createSelectionController(buttons, options)
 	local function apply(btn, selected)
 		local base = origSizes[btn]
 		if not base then return end
-		if selected then
-			btn.Size = UDim2.new(base.X.Scale * scale, base.X.Offset, base.Y.Scale * scale, base.Y.Offset)
-			if useStroke then setStrokeColor(btn, strokeActive) end
-		else
-			btn.Size = base
-			if useStroke then setStrokeColor(btn, strokeInactive) end
+
+		local targetSize = selected 
+			and UDim2.new(base.X.Scale * scale, base.X.Offset, base.Y.Scale * scale, base.Y.Offset)
+			or base
+		
+		local targetStroke = selected and strokeActive or strokeInactive
+		local targetImage  = selected and ACTIVE_IMAGE or INACTIVE_IMAGE
+
+		-- Tween Size
+		TweenService:Create(btn, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Size = targetSize
+		}):Play()
+
+		-- Stroke
+		if useStroke then 
+			setStrokeColor(btn, targetStroke) 
+		end
+
+		-- Image Swap (SOLO se richiesto, es. per i pulsanti della Home)
+		if swapImages then
+			local background = btn:FindFirstChild("Background")
+			if background then
+				if background:IsA("ImageLabel") then
+					background.Image = targetImage
+				else
+					local imageContent = background:FindFirstChild("ImageContent")
+					if imageContent and imageContent:IsA("ImageLabel") then
+						imageContent.Image = targetImage
+					end
+				end
+			end
 		end
 	end
 
@@ -226,33 +255,43 @@ local function ensureTransitionGui()
 		BlackFrame = Instance.new("Frame")
 		BlackFrame.Name = "BlackFade"
 		BlackFrame.Size = UDim2.new(1,0,1,0)
+		BlackFrame.Position = UDim2.new(1,0,0,0) -- Inizia fuori a destra
 		BlackFrame.BackgroundColor3 = Color3.new(0,0,0)
-		BlackFrame.BackgroundTransparency = 1
+		BlackFrame.BackgroundTransparency = 0 -- Opaco per lo star wars wipe
 		BlackFrame.ZIndex = 10
 		BlackFrame.Parent = TransitionGui
 	end
 end
 
-local function tweenBlack(from, to, dur)
+local function tweenWipe(targetPos, dur)
 	ensureTransitionGui()
-	BlackFrame.BackgroundTransparency = from
+	BlackFrame.BackgroundTransparency = 0
 	local tw = TweenService:Create(
 		BlackFrame,
-		TweenInfo.new(dur, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{BackgroundTransparency = to}
+		TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{Position = targetPos}
 	)
 	tw:Play()
 	return tw
 end
 
 local function fadeScreenAndSpawn(remoteCall)
-	local outTw = tweenBlack(1,0,SCREEN_FADE_OUT_TIME)
+	ensureTransitionGui()
+	-- 1. Wipe da destra a sinistra (Copre lo schermo)
+	local outTw = tweenWipe(UDim2.new(0,0,0,0), SCREEN_WIPE_TIME)
 	outTw.Completed:Wait()
+	
+	-- 2. Azione server (Morph/Spawn)
 	remoteCall()
-	task.wait(POST_REMOTE_DELAY)
+	
+	-- 3. Attesa più lunga per coprire il TP a spawn1/2/3
+	task.wait(WIPE_STAY_TIME)
+	
 	resetCameraToPlayer()
 	MainMenu.Enabled = false
-	local inTw = tweenBlack(0,1,SCREEN_FADE_IN_TIME)
+	
+	-- 4. Wipe da sinistra a destra (Rivela lo schermo)
+	local inTw = tweenWipe(UDim2.new(1,0,0,0), SCREEN_WIPE_TIME)
 	inTw.Completed:Wait()
 end
 
@@ -270,7 +309,7 @@ end
 -- Home buttons
 local homeButtons = { Home.Play, Home.Credits, Home.Shop, Home.Settings }
 local selectHomeButton = createSelectionController(homeButtons, {
-	scale=1.10, useStroke=false
+	scale=1.10, useStroke=false, swapImages=true
 })
 Home.Play.MouseButton1Click:Connect(function() 
 	showPanel(Play); 
