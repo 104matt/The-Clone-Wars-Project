@@ -1,9 +1,4 @@
--- Simple Loading Screen (graphic version preserved) + safe logic
--- Fixes:
---  1) DOES NOT disable other ScreenGuis (prevents MainMenu not coming back due to race conditions)
---  2) Still blocks clicks using a full-screen Active frame
---  3) Adds a failsafe timeout so you can't get permanently stuck
-
+-- Simple Loading Screen (GRAFICA ORIGINALE RIPRISTINATA + FIX 1%)
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -13,7 +8,13 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 -- =========================
--- COLORS / GRADIENTS (yours)
+-- LOGICA ANTI-BLOCCO (Esecuzione Singola)
+-- =========================
+if _G.LoadingScreenExecuted then return end
+_G.LoadingScreenExecuted = true
+
+-- =========================
+-- COLORI / GRADIENTI (ORIGINALI)
 -- =========================
 local gradient_fill_color = ColorSequence.new{
 	ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
@@ -30,56 +31,32 @@ local gradient_bg2_color = ColorSequence.new{
 }
 
 -- =========================
--- SHOW ONLY ONCE (safer)
--- =========================
-if playerGui:GetAttribute("LoadedOnce") then
-	return
-end
-playerGui:SetAttribute("LoadedOnce", true)
-
--- (Optional) keep your global flag if other scripts still rely on it,
--- but it's better to not depend on _G for core flow.
-_G.firstJoin = true
-
--- Remove any previous loading screen
-local old = playerGui:FindFirstChild("SimpleLoadingScreen")
-if old then old:Destroy() end
-
--- =========================
--- CREATE GUI (yours)
+-- CREAZIONE GUI (IDENTICA ALLA TUA)
 -- =========================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "SimpleLoadingScreen"
-screenGui.DisplayOrder = 1000
+screenGui.DisplayOrder = 10000 -- Molto alto per stare sopra a tutto
 screenGui.IgnoreGuiInset = true
 screenGui.ResetOnSpawn = false
 screenGui.Parent = playerGui
 
--- Container (kept from your script)
 local canvasGroup = Instance.new("Frame")
 canvasGroup.Name = "CanvasGroup"
 canvasGroup.BackgroundTransparency = 1
 canvasGroup.Size = UDim2.new(1,0,1,0)
-canvasGroup.Position = UDim2.new(0,0,0,0)
 canvasGroup.Parent = screenGui
 
--- Background full screen: this blocks input so players can't click GUIs behind it
 local bg = Instance.new("Frame")
 bg.BackgroundColor3 = Color3.fromRGB(121, 121, 121)
-bg.BackgroundTransparency = 0
 bg.Size = UDim2.new(1,0,1,0)
-bg.Position = UDim2.new(0,0,0,0)
-bg.AnchorPoint = Vector2.new(0,0)
-bg.Parent = canvasGroup
 bg.Active = true
-bg.Selectable = true
+bg.Parent = canvasGroup
 
 local UIGradientBG = Instance.new("UIGradient")
 UIGradientBG.Color = gradient_bg2_color
 UIGradientBG.Rotation = -90
 UIGradientBG.Parent = bg
 
--- Logo (yours)
 local repLogo = Instance.new("ImageLabel")
 repLogo.Size = UDim2.new(0.15,0,0.25,0)
 repLogo.AnchorPoint = Vector2.new(0.5,0.5)
@@ -95,7 +72,6 @@ UIGradientLogo.Color = gradient_fill_color
 UIGradientLogo.Rotation = 90
 UIGradientLogo.Parent = repLogo
 
--- Loading bar (yours)
 local barBack = Instance.new("Frame")
 barBack.Size = UDim2.new(0.5,0,0.05,0)
 barBack.Position = UDim2.new(0.25,0,0.75,0)
@@ -134,9 +110,8 @@ local UICorner2 = Instance.new("UICorner")
 UICorner2.CornerRadius = UDim.new(5,0)
 UICorner2.Parent = barFill
 
--- Text (yours)
 local text = Instance.new("TextLabel")
-text.Text = "Loading 0% - ..."
+text.Text = "LOADING 0% - ..."
 text.Size = UDim2.new(0.5,0,0.06,0)
 text.Position = UDim2.new(0.25,0,0.68,0)
 text.BackgroundTransparency = 1
@@ -156,136 +131,101 @@ differentText.TextSize = 28
 differentText.Parent = bg
 
 -- =========================
--- ANIMATIONS (yours)
+-- ANIMAZIONI & NPC (ORIGINALI)
 -- =========================
 local rotationSpeed = 180
 local repRotation = 0
 RunService.RenderStepped:Connect(function(dt)
-	repRotation = (repRotation + rotationSpeed * dt) % 360
-	repLogo.Rotation = repRotation
+	if bg.Parent then
+		repRotation = (repRotation + rotationSpeed * dt) % 360
+		repLogo.Rotation = repRotation
+	end
 end)
 
--- =========================
--- StartBackgroundNPC BoolValue (yours, but safer)
--- =========================
 local function ensureStartBackgroundNPC()
 	local v = ReplicatedStorage:FindFirstChild("StartBackgroundNPC")
 	if not v then
-		v = Instance.new("BoolValue")
+		v = Instance.new("BoolValue", ReplicatedStorage)
 		v.Name = "StartBackgroundNPC"
-		v.Value = false
-		v.Parent = ReplicatedStorage
 	end
 	return v
 end
 
-local startBackgroundNPC = ensureStartBackgroundNPC()
-
 -- =========================
--- ENDING / DESTROY (yours + failsafe)
+-- FUNZIONE DI CHIUSURA E MAIN MENU (CORRETTA)
 -- =========================
-local function slideUpAndDestroy(callback)
-	local tween = TweenService:Create(
-		bg,
-		TweenInfo.new(0.7, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
-		{Position = UDim2.new(0,0,-1,0)}
-	)
-	tween:Play()
-	task.wait(0.8) -- Failsafe wait
-	if callback then callback() end
-end
-
 local finished = false
 local function endLoading()
 	if finished then return end
 	finished = true
 
-	-- Trigger NPCs
+	-- Attivazione NPC
+	local startBackgroundNPC = ensureStartBackgroundNPC()
 	startBackgroundNPC.Value = true
 
-	-- Wait 2 frames
-	RunService.Heartbeat:Wait()
-	RunService.Heartbeat:Wait()
-
-	local function forceMainMenuOn()
-		local menu = playerGui:FindFirstChild("MainMenu") or playerGui:FindFirstChild("MainMenu", true)
+	-- LOGICA MENU PRINCIPALE (Assicura che appaia)
+	local function forceMenu()
+		local menu = playerGui:FindFirstChild("MainMenu", true)
 		if menu and menu:IsA("ScreenGui") then
 			menu.Enabled = true
 		end
-
-		-- Also force menu camera if your menu uses a Scriptable camera
+		
+		-- Camera del Menu
 		local cam = workspace.CurrentCamera
-		local part = workspace:FindFirstChild("MainMenuWorkspace")
-			and workspace.MainMenuWorkspace:FindFirstChild("Camera")
-			and workspace.MainMenuWorkspace.Camera:FindFirstChild("MainCamera")
-
-		if cam and part then
+		local menuWorkspace = workspace:FindFirstChild("MainMenuWorkspace")
+		local camPart = menuWorkspace and menuWorkspace:FindFirstChild("Camera") and menuWorkspace.Camera:FindFirstChild("MainCamera")
+		
+		if cam and camPart then
 			cam.CameraType = Enum.CameraType.Scriptable
-			cam.CFrame = part.CFrame
+			cam.CFrame = camPart.CFrame
 		end
 	end
 
-	-- Call it a few times to win race conditions (Reduced from 30 to 10 for speed)
-	for i = 1, 10 do
-		forceMainMenuOn()
-		RunService.Heartbeat:Wait()
-	end
-	
-	slideUpAndDestroy(function()
-		if screenGui.Parent then
-			screenGui:Destroy()
+	-- Eseguiamo il trigger del menu più volte per sicurezza
+	task.spawn(function()
+		for i = 1, 5 do
+			forceMenu()
+			task.wait(0.1)
 		end
 	end)
-	
+
+	-- Animazione di uscita
+	local tween = TweenService:Create(bg, TweenInfo.new(0.8, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {Position = UDim2.new(0,0,-1,0)})
+	tween:Play()
+	tween.Completed:Connect(function()
+		screenGui:Destroy()
+	end)
 end
 
 -- =========================
--- PROGRESS SIMULATION (stable: loop-based)
+-- LOOP DI CARICAMENTO (FIX PER IL BLOCCO 1%)
 -- =========================
-local loadingSteps = {
-	"Rep Storage",
-	"Ranks & Groups",
-	"Inventory",
-	"Player Data",
-	"Finishing Up"
-}
-
-local LOADING_DURATION = 4.0 
+local loadingSteps = {"Rep Storage", "Ranks & Groups", "Inventory", "Player Data", "Finishing Up"}
 
 task.spawn(function()
-	print("[LoadingScreen] Simulazione avviata")
-	local steps = 100
-	for i = 0, steps do
-		if finished then break end
+	-- Piccolo delay iniziale per evitare il freeze immediato all'1%
+	task.wait(0.5) 
+	
+	local totalSteps = 100
+	for i = 0, totalSteps do
+		local percent = i / totalSteps
 		
-		local percent = i / steps
+		-- Aggiornamento UI
 		barFill.Size = UDim2.new(percent, 0, 1, 0)
+		local stepIdx = math.clamp(math.floor(percent * (#loadingSteps - 1)) + 1, 1, #loadingSteps)
+		text.Text = string.upper(string.format("Loading %d%% - %s", i, loadingSteps[stepIdx]))
 		
-		local stepIndex = math.clamp(math.floor(percent * (#loadingSteps - 1)) + 1, 1, #loadingSteps)
-		text.Text = string.upper(string.format("Loading %d%% - %s", math.floor(percent * 100), loadingSteps[stepIndex]))
-		
-		if i % 20 == 0 then
-			print("[LoadingScreen] Progresso:", i, "%")
-		end
-
-		-- Calcola quanto tempo aspettare per ogni step
-		local stepTime = LOADING_DURATION / steps
-		local elapsed = 0
-		while elapsed < stepTime do
-			elapsed += RunService.Heartbeat:Wait()
-		end
+		-- Velocità caricamento (4 secondi totali circa)
+		task.wait(0.04) 
 	end
 	
-	if not finished then
-		print("[LoadingScreen] Fine loop, chiusura...")
-		endLoading()
-	end
+	endLoading()
 end)
 
--- FAILSAFE: Ensure the screen disappears even if something hangs
-task.delay(LOADING_DURATION + 10, function()
+-- FAILSAFE (15 secondi)
+task.delay(15, function()
 	if not finished then
-		warn("[LoadingScreen] FAILSAFE TRIGGERED")
+		warn("Loading Screen Failsafe Triggered!")
 		endLoading()
 	end
 end)
