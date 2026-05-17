@@ -24,11 +24,12 @@ local CONFIG = {
 	TARGET_TEAM       = "Republic",   -- nome esatto del team bersaglio
 	VISION_RANGE      = 120,          -- distanza max in cui il droide vede
 	ATTACK_RANGE      = 90,           -- entra in fuoco se entro questa distanza
-	PREFERRED_RANGE   = 50,           -- si ferma a sparare entro questa distanza
+	MELEE_STOP_RANGE  = 6,            -- si ferma solo se quasi addosso al target (per non sovrapporsi)
 	WALK_SPEED        = 10,
 	MAX_HEALTH        = 60,
 	REPATH_INTERVAL   = 0.5,          -- ogni quanto aggiornare il MoveTo
-	LOSS_OF_SIGHT_T   = 3,            -- secondi prima di tornare in idle se target perso
+	TURN_SPEED        = 6,            -- velocità rotazione verso il target (lerp factor per secondo)
+	FIRE_ANGLE_DEG    = 25,           -- angolo max tra forward del droide e direzione target per poter sparare
 	DEATH_FADE_TIME   = 2,
 	DEATH_LINGER      = 4,            -- secondi prima del Destroy
 	ANIM_IDS = {
@@ -175,43 +176,65 @@ end
 
 humanoid.Died:Connect(onDeath)
 
--- ============ MAIN LOOP =================
-local lastTargetSeen = 0
-local lastShotAttempt = 0
+-- ============ FACING LOOP ================
+-- Heartbeat dedicato alla rotazione: il droide deve sempre guardare il target,
+-- sia mentre cammina sia da fermo. Disabilito AutoRotate del Humanoid per evitare
+-- che combatta con questa rotazione manuale quando ci si muove di traverso.
+humanoid.AutoRotate = false
 
+local currentTargetHrp -- aggiornato dal main loop
+
+local cosFireAngle = math.cos(math.rad(CONFIG.FIRE_ANGLE_DEG))
+
+local function angleAlignedToTarget()
+	if not currentTargetHrp then return false end
+	local toTarget = currentTargetHrp.Position - rootPart.Position
+	toTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if toTarget.Magnitude < 0.01 then return true end
+	local forward = rootPart.CFrame.LookVector
+	forward = Vector3.new(forward.X, 0, forward.Z)
+	if forward.Magnitude < 0.01 then return false end
+	return forward.Unit:Dot(toTarget.Unit) >= cosFireAngle
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	if dead or not currentTargetHrp or not currentTargetHrp.Parent then return end
+	local targetPos = currentTargetHrp.Position
+	local lookPos   = Vector3.new(targetPos.X, rootPart.Position.Y, targetPos.Z)
+	if (lookPos - rootPart.Position).Magnitude < 0.05 then return end
+	local goal  = CFrame.lookAt(rootPart.Position, lookPos)
+	local alpha = math.clamp(CONFIG.TURN_SPEED * dt, 0, 1)
+	rootPart.CFrame = rootPart.CFrame:Lerp(goal, alpha)
+end)
+
+-- ============ MAIN LOOP =================
 task.spawn(function()
 	while not dead and humanoid.Health > 0 do
 		local _, targetHrp, dist = findTarget()
-		local now = os.clock()
+		currentTargetHrp = targetHrp
 
 		if targetHrp then
-			lastTargetSeen = now
-
-			-- ruota verso il target (solo sull'asse Y)
-			local lookPos = Vector3.new(targetHrp.Position.X, rootPart.Position.Y, targetHrp.Position.Z)
-			rootPart.CFrame = rootPart.CFrame:Lerp(CFrame.lookAt(rootPart.Position, lookPos), 0.25)
-
-			if dist > CONFIG.PREFERRED_RANGE then
-				-- avanza verso il target
+			-- avanza verso il target SEMPRE: il droide cammina e spara insieme
+			if dist > CONFIG.MELEE_STOP_RANGE then
 				humanoid:MoveTo(targetHrp.Position)
 				playLocomotion("Walk")
 			else
-				-- abbastanza vicino: fermati e spara
+				-- praticamente addosso, evita di pestare il player
 				humanoid:MoveTo(rootPart.Position)
 				playLocomotion("Idle")
 			end
 
-			if dist <= CONFIG.ATTACK_RANGE and fireEvent then
+			-- spara solo se è girato verso il target (no fuoco "alle spalle")
+			if dist <= CONFIG.ATTACK_RANGE and fireEvent and angleAlignedToTarget() then
 				if tracks.Shoot and not tracks.Shoot.IsPlaying then
 					tracks.Shoot:Play(0.05)
 				end
 				fireEvent:Fire(targetHrp.Position)
 			end
 		else
-			-- nessun target: idle
-			if now - lastTargetSeen > CONFIG.LOSS_OF_SIGHT_T then
-				playLocomotion("Idle")
-			end
+			-- nessun target: fermo, in idle
+			humanoid:MoveTo(rootPart.Position)
+			playLocomotion("Idle")
 		end
 
 		task.wait(CONFIG.REPATH_INTERVAL)

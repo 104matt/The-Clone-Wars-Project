@@ -12,7 +12,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Debris            = game:GetService("Debris")
 
-local LaserBolt = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("LaserBolt"))
+local LaserSystem = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("LaserSystem"))
 
 -- ================= CONFIG =================
 local FIRE_COOLDOWN     = 0.6         -- secondi tra un colpo e l'altro
@@ -84,7 +84,7 @@ local function fireAt(targetPosition)
 	playMuzzle()
 
 	local shooterModel = E5:FindFirstAncestorOfClass("Model")
-	LaserBolt.Fire({
+	LaserSystem.Fire({
 		origin    = origin,
 		direction = dir,
 		shooter   = shooterModel,
