@@ -30,6 +30,9 @@ local CONFIG = {
 	REPATH_INTERVAL   = 0.5,          -- ogni quanto aggiornare il MoveTo
 	TURN_SPEED        = 6,            -- velocità rotazione verso il target (lerp factor per secondo)
 	FIRE_ANGLE_DEG    = 25,           -- angolo max tra forward del droide e direzione target per poter sparare
+	FACING_OFFSET_DEG = 180,          -- offset rotazione attorno a Y per compensare rig "girati":
+	                                  --   * 0   = rig R15/R6 standard (mesh guarda verso LookVector di HRP)
+	                                  --   * 180 = rig Mixamo / Hips che guarda nel verso opposto (default qui)
 	DEATH_FADE_TIME   = 2,
 	DEATH_LINGER      = 4,            -- secondi prima del Destroy
 	ANIM_IDS = {
@@ -184,14 +187,21 @@ humanoid.AutoRotate = false
 
 local currentTargetHrp -- aggiornato dal main loop
 
-local cosFireAngle = math.cos(math.rad(CONFIG.FIRE_ANGLE_DEG))
+local cosFireAngle    = math.cos(math.rad(CONFIG.FIRE_ANGLE_DEG))
+local facingOffsetRad = math.rad(CONFIG.FACING_OFFSET_DEG)
+local facingOffsetCF  = CFrame.Angles(0, facingOffsetRad, 0)
+
+-- "Front reale" del droide = LookVector di HRP ruotato dell'offset configurato.
+local function realForward()
+	return (rootPart.CFrame * facingOffsetCF).LookVector
+end
 
 local function angleAlignedToTarget()
 	if not currentTargetHrp then return false end
 	local toTarget = currentTargetHrp.Position - rootPart.Position
 	toTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
 	if toTarget.Magnitude < 0.01 then return true end
-	local forward = rootPart.CFrame.LookVector
+	local forward = realForward()
 	forward = Vector3.new(forward.X, 0, forward.Z)
 	if forward.Magnitude < 0.01 then return false end
 	return forward.Unit:Dot(toTarget.Unit) >= cosFireAngle
@@ -202,7 +212,8 @@ RunService.Heartbeat:Connect(function(dt)
 	local targetPos = currentTargetHrp.Position
 	local lookPos   = Vector3.new(targetPos.X, rootPart.Position.Y, targetPos.Z)
 	if (lookPos - rootPart.Position).Magnitude < 0.05 then return end
-	local goal  = CFrame.lookAt(rootPart.Position, lookPos)
+	-- vogliamo che la mesh (front reale) guardi il target: contro-ruotiamo l'offset sul goal
+	local goal  = CFrame.lookAt(rootPart.Position, lookPos) * facingOffsetCF:Inverse()
 	local alpha = math.clamp(CONFIG.TURN_SPEED * dt, 0, 1)
 	rootPart.CFrame = rootPart.CFrame:Lerp(goal, alpha)
 end)
