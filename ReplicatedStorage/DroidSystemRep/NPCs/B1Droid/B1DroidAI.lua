@@ -45,10 +45,10 @@ local CONFIG = {
 	-- pathfinding
 	AGENT_RADIUS       = 3,
 	AGENT_HEIGHT       = 5,
-	AGENT_CAN_JUMP     = true,
+	AGENT_CAN_JUMP     = true,        -- il PathfindingService può inserire salti SOLO quando strettamente necessario
+	JUMP_POWER         = 18,          -- molto basso: i droidi non sono ginnasti
 	PF_WAYPOINT_REACH  = 2,           -- soglia di "raggiunto" per i sotto-waypoint del PathfindingService
 	PF_REPATH_TIMEOUT  = 1.0,         -- secondi senza avanzare prima di ricalcolare
-	PF_STUCK_JUMP_AT   = 0.5,         -- dopo quanto stuck provare un salto per sbloccarsi
 
 	-- fazione (per evitare friendly fire)
 	FACTION            = "CIS",
@@ -98,8 +98,12 @@ humanoid.WalkSpeed  = CONFIG.WALK_SPEED
 humanoid.MaxHealth  = CONFIG.MAX_HEALTH
 humanoid.Health     = CONFIG.MAX_HEALTH
 humanoid.AutoRotate = false
--- Permetti al droide di saltare gli scalini quando il PathfindingService lo richiede.
+-- Permetti al droide di saltare SOLO quando il PathfindingService lo richiede esplicitamente.
+-- JumpPower è volutamente basso: niente saltelli da NBA player.
 humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+humanoid.JumpPower  = CONFIG.JUMP_POWER
+-- UseJumpPower esiste solo nei rig moderni; pcall per essere safe su rig vecchi.
+pcall(function() humanoid.UseJumpPower = true end)
 
 -- Imposta la fazione del modello (usata da LaserSystem per evitare fuoco amico).
 if droid:GetAttribute("Faction") == nil then
@@ -196,6 +200,17 @@ if tracks.Death     then tracks.Death.Priority     = Enum.AnimationPriority.Acti
 if tracks.DeathIdle then tracks.DeathIdle.Priority = Enum.AnimationPriority.Action4  end
 if tracks.DeathIdle then tracks.DeathIdle.Looped   = true                             end
 
+-- ----- WalkingSound (opzionale) -----
+-- Se nel modello del droide esiste un Sound chiamato "WalkingSound", lo
+-- riproduciamo in loop mentre cammina e lo fermiamo quando si ferma/idle.
+-- Se non esiste, semplicemente non lo riproduciamo (nessun warning).
+local walkingSound = droid:FindFirstChild("WalkingSound", true)
+if walkingSound and walkingSound:IsA("Sound") then
+	walkingSound.Looped = true
+else
+	walkingSound = nil
+end
+
 local currentLocomotion
 local function playLocomotion(name)
 	if currentLocomotion == name then return end
@@ -207,6 +222,14 @@ local function playLocomotion(name)
 			else
 				if track.IsPlaying then track:Stop(0.2) end
 			end
+		end
+	end
+	-- Sync del WalkingSound con lo stato di locomozione
+	if walkingSound then
+		if name == "Walk" then
+			if not walkingSound.IsPlaying then walkingSound:Play() end
+		else
+			if walkingSound.IsPlaying then walkingSound:Stop() end
 		end
 	end
 end
@@ -376,6 +399,7 @@ local function onDeath()
 		local t = tracks[key]
 		if t and t.IsPlaying then t:Stop(0.1) end
 	end
+	if walkingSound and walkingSound.IsPlaying then walkingSound:Stop() end
 
 	humanoid.AutoRotate    = false
 	humanoid.WalkSpeed     = 0
@@ -461,7 +485,6 @@ local function walkToWithPathfinding(destPos)
 
 			local lastPos = rootPart.Position
 			local stuckTimer = 0
-			local jumpedToUnstick = false
 			-- soglia di spostamento per essere considerato "in movimento":
 			-- WalkSpeed * intervallo * fattore. Sotto questa soglia il droide è fermo.
 			local moveThreshold = CONFIG.WALK_SPEED * CONFIG.REPATH_INTERVAL * 0.25
@@ -470,13 +493,12 @@ local function walkToWithPathfinding(destPos)
 				d = math.sqrt(d.X * d.X + d.Z * d.Z)
 				if d <= CONFIG.PF_WAYPOINT_REACH then break end
 
-				-- combat + facing durante il movimento
+				-- Combat opportunistico DURANTE il path: il droide non si gira verso il
+				-- player. Continua a guardare il prossimo waypoint; spara SOLO se il
+				-- player capita nell'arco di tiro davanti a lui (gestito in combatTick
+				-- tramite angleAlignedTo). Niente face-tracking finché non finisce il path.
 				combatTick()
-				if isHostile and currentTargetHrp and currentTargetHrp.Parent then
-					facingGoal = currentTargetHrp.Position
-				else
-					facingGoal = wp.Position
-				end
+				facingGoal = wp.Position
 
 				-- Re-emetti MoveTo: dopo un salto (o un timeout interno del Humanoid)
 				-- la direzione di movimento può azzerarsi e il droide "cammina nel vuoto".
@@ -484,20 +506,17 @@ local function walkToWithPathfinding(destPos)
 
 				-- Stuck detection: non contare come "stuck" se siamo in aria (es. dopo
 				-- un salto). Aspetta di tornare a terra prima di rivalutare.
+				-- NB: niente auto-jump per sbloccarsi — i droidi saltano solo se il
+				-- PathfindingService inserisce esplicitamente un waypoint Jump.
 				local airborne = humanoid.FloorMaterial == Enum.Material.Air
 				local moved = (rootPart.Position - lastPos).Magnitude
 				if not airborne and moved < moveThreshold then
 					stuckTimer = stuckTimer + CONFIG.REPATH_INTERVAL
-					if not jumpedToUnstick and stuckTimer >= CONFIG.PF_STUCK_JUMP_AT then
-						humanoid.Jump = true
-						jumpedToUnstick = true
-					end
 					if stuckTimer >= CONFIG.PF_REPATH_TIMEOUT then
 						return false -- richiede ricalcolo
 					end
 				else
 					stuckTimer = 0
-					if not airborne then jumpedToUnstick = false end
 				end
 				lastPos = rootPart.Position
 
