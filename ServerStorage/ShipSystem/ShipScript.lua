@@ -527,105 +527,59 @@ local function spawnLaserInternal(originPos, direction)
 	local laser = laserTemplate:Clone()
 	ldbg("clone ok:", laser.ClassName, " transparency=", laser.Transparency, " size=", laser.Size)
 
-	-- Dump dei children del clone (vediamo se Beams/Trail/PointLight sono presenti e Enabled)
-	if LASER_DEBUG then
-		for _, c in ipairs(laser:GetDescendants()) do
-			if c:IsA("Beam") then
-				print(("  [child] Beam %s  Enabled=%s  A0=%s  A1=%s"):format(
-					c:GetFullName(), tostring(c.Enabled),
-					c.Attachment0 and c.Attachment0.Name or "nil",
-					c.Attachment1 and c.Attachment1.Name or "nil"))
-			elseif c:IsA("Trail") then
-				print(("  [child] Trail %s  Enabled=%s"):format(c:GetFullName(), tostring(c.Enabled)))
-			elseif c:IsA("ParticleEmitter") then
-				print(("  [child] ParticleEmitter %s  Enabled=%s  Rate=%s"):format(
-					c:GetFullName(), tostring(c.Enabled), tostring(c.Rate)))
-			elseif c:IsA("Attachment") then
-				print(("  [child] Attachment %s  pos=%s"):format(c.Name, tostring(c.Position)))
-			elseif c:IsA("Light") then
-				print(("  [child] %s  Enabled=%s  Brightness=%s"):format(
-					c.ClassName, tostring(c.Enabled), tostring(c.Brightness)))
-			end
-		end
-	end
-
 	-- IMPORTANTE: NON tocco ne' Transparency ne' Size del clone -- vengono dal
 	-- template e l'utente vuole che restino come sono.
+	--
+	-- Movimento: NIENTE LinearVelocity. Con MaxForce=huge + Massless=true il
+	-- solver applicava forze/torque infiniti sugli Attachment offset, e il
+	-- bullet veniva sparato a 10^9 studs in un frame (fuori dai bounds di
+	-- Roblox -> auto-destroy). Usiamo invece Anchored + CFrame loop a mano
+	-- + raycast per la hit detection: prevedibile, niente sorprese fisiche.
 	laser.Name       = "ShipLaser"
-	laser.Anchored   = false
+	laser.Anchored   = true
 	laser.CanCollide = false
 	laser.CanQuery   = false
-	laser.CanTouch   = true
-	laser.Massless   = true
+	laser.CanTouch   = false
 	laser.CFrame     = CFrame.lookAt(originPos, originPos + direction)
-	ldbg("CFrame set, position=", laser.Position)
-
-	-- Usiamo (o creiamo) un Attachment per la LinearVelocity. Se il template
-	-- ha gia' un Attachment chiamato "Tail" lo riusiamo.
-	local att = laser:FindFirstChild("Tail")
-	if not att or not att:IsA("Attachment") then
-		att = laser:FindFirstChildOfClass("Attachment")
-	end
-	if not att then
-		att = Instance.new("Attachment")
-		att.Name   = "VelocityAttachment"
-		att.Parent = laser
-	end
-
-	local lv = Instance.new("LinearVelocity")
-	lv.Attachment0    = att
-	lv.MaxForce       = math.huge
-	lv.RelativeTo     = Enum.ActuatorRelativeTo.World
-	lv.VectorVelocity = direction * LASER_SPEED
-	lv.Parent         = laser
-	ldbg("LinearVelocity attaccata, velocity=", lv.VectorVelocity)
-
-	laser.Parent = getBulletsFolder()
+	laser.Parent     = getBulletsFolder()
 	ldbg("PARENTED in", laser.Parent and laser.Parent:GetFullName() or "<nil>")
 
-	-- DEBUG: traccia ogni cambio di Parent. Se qualcosa sgancia il bullet
-	-- subito dopo il PARENTED, lo becchiamo qui.
-	local ancestryConn
-	ancestryConn = laser.AncestryChanged:Connect(function(_, newParent)
-		ldbg("ANCESTRY change: laser.Parent =", newParent and newParent:GetFullName() or "<nil>")
-		if not newParent then
-			-- L'oggetto e' stato sganciato/distrutto. Ferma il listener.
-			if ancestryConn then ancestryConn:Disconnect() end
-		end
-	end)
+	-- Loop di movimento + raycast forward per hit detection.
+	task.spawn(function()
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Exclude
+		rayParams.FilterDescendantsInstances = { ship, getBulletsFolder() }
+		rayParams.IgnoreWater = true
 
-	-- DEBUG: dopo 1s controlla se e' ancora vivo e dove sta.
-	task.delay(1, function()
-		if laser and laser.Parent then
-			ldbg(("ALIVE@1s: parent=%s  pos=%s  vel=%s"):format(
-				laser.Parent:GetFullName(),
-				tostring(laser.Position),
-				tostring(laser.AssemblyLinearVelocity)))
-		else
-			ldbg("DEAD@1s: il laser e' stato distrutto entro 1 secondo")
-		end
-	end)
+		local startTime = os.clock()
+		local lastTime  = startTime
 
-	local conn
-	conn = laser.Touched:Connect(function(other)
-		if other:IsDescendantOf(ship) then return end
-		-- Ignora altri proiettili nella stessa cartella (evita auto-distruzioni).
-		if other.Parent and other.Parent.Name == BULLETS_FOLDER_NAME then return end
+		while laser.Parent and (os.clock() - startTime) < LASER_LIFETIME do
+			local now = os.clock()
+			local dt  = now - lastTime
+			lastTime  = now
 
-		ldbg("TOUCHED other=", other:GetFullName(), "  (would destroy)")
+			local step = direction * LASER_SPEED * dt
+			-- Raycast dal punto attuale di step studs in avanti.
+			local hit = workspace:Raycast(laser.Position, step, rayParams)
+			if hit then
+				-- Sposta il bullet sul punto d'impatto.
+				laser.CFrame = CFrame.lookAt(hit.Position, hit.Position + direction)
+				local model = hit.Instance:FindFirstAncestorOfClass("Model")
+				local hum   = model and model:FindFirstChildOfClass("Humanoid")
+				if hum and hum.Health > 0 then
+					hum:TakeDamage(CONFIG.Damage)
+				end
+				ldbg("HIT", hit.Instance:GetFullName())
+				break
+			end
 
-		local model = other:FindFirstAncestorOfClass("Model")
-		local hum   = model and model:FindFirstChildOfClass("Humanoid")
-		if hum and hum.Health > 0 then
-			hum:TakeDamage(CONFIG.Damage)
+			laser.CFrame = laser.CFrame + step
+			task.wait()
 		end
 
-		if LASER_NO_DESTROY then return end  -- DEBUG: lascia vivere il bullet
-		if conn then conn:Disconnect() end
-		laser:Destroy()
+		if laser.Parent then laser:Destroy() end
 	end)
-
-	Debris:AddItem(laser, LASER_LIFETIME)
 end
 
 -- Wrapper: cattura QUALSIASI errore in spawnLaserInternal e lo stampa con
