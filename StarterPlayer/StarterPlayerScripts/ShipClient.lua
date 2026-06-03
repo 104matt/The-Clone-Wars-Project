@@ -1158,7 +1158,7 @@ local function startFlight(ship, seat)
 	-- Avvio sempre in Hangar
 	state.mode = nil
 	setMode("hangar")
-	setMouseLocked(true)
+	setMouseLocked(false)
 end
 
 local function stopFlight()
@@ -1172,7 +1172,10 @@ local function stopFlight()
 	for _, l in ipairs(HUD.BoxLines) do l.Visible = false end
 
 	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-	if hum then hum.CameraOffset = Vector3.zero end
+	if hum then
+		hum.CameraOffset = Vector3.zero
+		camera.CameraSubject = hum
+	end
 
 	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls" }) do
 		local card = HUD.Gui:FindFirstChild(name)
@@ -1295,6 +1298,12 @@ local function limitDirectionChange(currentDir, targetDir, maxAngle)
 	return safeUnit(from:Lerp(to, t), to)
 end
 
+local function pointerScreenPosition()
+	local mousePos = UserInputService:GetMouseLocation()
+	local inset    = GuiService:GetGuiInset()
+	return Vector2.new(mousePos.X - inset.X, mousePos.Y - inset.Y)
+end
+
 -- ============================================================================
 -- RENDER LOOP
 -- ============================================================================
@@ -1332,109 +1341,20 @@ RunService.RenderStepped:Connect(function(dt)
 	-- ========================================================================
 	-- CAMERA
 	-- ========================================================================
-	local inHangar   = (state.mode == "hangar")
-	local inFreeLook = (state.mode == "combat" and state.freeLook)
-	local zoomPart   = state.zoomPart
-	local noseBasisCF = getNoseBasisCF() or state.primary.CFrame
-	local shipPos    = refWorldPosition(state.noseRef, state.primary.Position)
-	local profilePos, profileLook, profileUp
-
-	if inHangar or inFreeLook then
-		-- Orbita libera (profilo free-look/hangar)
-		local pivot = shipPos + Vector3.new(0, 2, 0)
-		local rot   = CFrame.Angles(0, state.hoverYaw, 0) * CFrame.Angles(state.hoverPitch, 0, 0)
-		local offset = rot * Vector3.new(0, 0, state.hoverDistance)
-		profilePos = pivot + offset
-		profileLook = pivot
-		profileUp = Vector3.yAxis
-	else
-		-- Combat chase indipendente da CameraPart.CFrame
-		local refCF = state.aimCFrame or noseBasisCF
-		local shipFwd = refCF.LookVector
-		local shipUp  = refCF.UpVector
-
-		if state.camera.combatOffset then
-			profilePos = state.primary.CFrame:PointToWorldSpace(
-				state.camera.combatOffset + Vector3.new(0, 0, state.chaseDistance)
-			)
-		else
-			profilePos = shipPos
-				- shipFwd * (FLIGHT_CHASE_BACK + state.chaseDistance)
-				+ shipUp  * FLIGHT_CHASE_UP
-		end
-
-		local speedForLook = math.clamp(state.currentSpeed, 0, math.max(state.config.MaxSpeed, 1))
-		profileLook = shipPos
-			+ shipFwd * (CAMERA_LOOK_AHEAD_BASE + speedForLook * CAMERA_LOOK_AHEAD_SPEED_SCALE)
-			+ state.flightVel * CAMERA_LOOK_AHEAD_VEL_SCALE
-
-		local targetBank = math.clamp((state.roll + state.bank) * CAMERA_BANK_INFLUENCE, -CAMERA_BANK_MAX, CAMERA_BANK_MAX)
-		local maxBankStep = CAMERA_BANK_MAX_RATE * dt
-		local bankDelta = math.clamp(targetBank - state.camera.bankFiltered, -maxBankStep, maxBankStep)
-		state.camera.bankFiltered = state.camera.bankFiltered + bankDelta
-		state.camera.bankFiltered = state.camera.bankFiltered
-			+ (targetBank - state.camera.bankFiltered) * smoothAlpha(CAMERA_GYRO_FILTER_LAMBDA, dt)
-
-		local bankCF = CFrame.fromAxisAngle(shipFwd, state.camera.bankFiltered)
-		profileUp = safeUnit(bankCF:VectorToWorldSpace(shipUp), shipUp)
+	camera.CameraType = Enum.CameraType.Custom
+	if state.seat and camera.CameraSubject ~= state.seat then
+		camera.CameraSubject = state.seat
 	end
-
-	local zoomTarget = (state.zoomMode and zoomPart) and 1 or 0
-	state.camera.zoomAlpha = state.camera.zoomAlpha
-		+ (zoomTarget - state.camera.zoomAlpha) * smoothAlpha(CAMERA_ZOOM_BLEND_LAMBDA, dt)
-	if zoomPart and state.camera.zoomAlpha > 0.001 then
-		local zPos  = zoomPart.Position
-		local zLook = zPos + zoomPart.CFrame.LookVector * CAMERA_DEFAULT_LOOK_DISTANCE
-		local zUp   = zoomPart.CFrame.UpVector
-		profilePos  = profilePos:Lerp(zPos, state.camera.zoomAlpha)
-		profileLook = profileLook:Lerp(zLook, state.camera.zoomAlpha)
-		profileUp   = safeUnit(profileUp:Lerp(zUp, state.camera.zoomAlpha), zUp)
-	end
-
-	profileLook = clampLookPitch(profilePos, profileLook, CAMERA_MIN_PITCH, CAMERA_MAX_PITCH)
-
-	if not state.camera.initialized then
-		state.camera.initialized  = true
-		state.camera.position     = profilePos
-		state.camera.lookPoint    = profileLook
-		state.camera.upVector     = profileUp
-		state.camera.velocity     = Vector3.zero
-		state.camera.lookVelocity = Vector3.zero
-	end
-
-	local currentDir = state.camera.lookPoint - state.camera.position
-	local targetDir  = profileLook - profilePos
-	local maxAngle   = CAMERA_MAX_ANGULAR_SPEED * dt
-	local limitedDir = limitDirectionChange(currentDir, targetDir, maxAngle)
-	local lookDist   = math.max(targetDir.Magnitude, CAMERA_DEFAULT_LOOK_DISTANCE)
-	local limitedLook = profilePos + limitedDir * lookDist
-
-	state.camera.position, state.camera.velocity = springStep(
-		state.camera.position, state.camera.velocity, profilePos,
-		CAMERA_FOLLOW_STIFFNESS, CAMERA_FOLLOW_DAMPING, dt
-	)
-	state.camera.lookPoint, state.camera.lookVelocity = springStep(
-		state.camera.lookPoint, state.camera.lookVelocity, limitedLook,
-		CAMERA_LOOK_STIFFNESS, CAMERA_LOOK_DAMPING, dt
-	)
-	state.camera.upVector = safeUnit(
-		state.camera.upVector:Lerp(profileUp, smoothAlpha(CAMERA_UP_LAMBDA, dt)),
-		profileUp
-	)
-
-	local lookTarget = state.camera.lookPoint
-	if (lookTarget - state.camera.position).Magnitude < 1 then
-		lookTarget = state.camera.position + limitedDir * CAMERA_DEFAULT_LOOK_DISTANCE
-	end
-
-	camera.CameraType = Enum.CameraType.Scriptable
-	camera.CFrame = CFrame.lookAt(state.camera.position, lookTarget, state.camera.upVector)
 
 	mouse.TargetFilter = state.ship
 
 	-- ========================================================================
 	-- PHYSICS
 	-- ========================================================================
+	local inHangar   = (state.mode == "hangar")
+	local inFreeLook = (state.mode == "combat" and state.freeLook)
+	local noseBasisCF = getNoseBasisCF() or state.primary.CFrame
+	local shipPos    = refWorldPosition(state.noseRef, state.primary.Position)
 	local fwdInput, rgtInput = readMoveInput()
 	local maxSpeed = math.max(state.config.MaxSpeed, 1)
 
@@ -1492,40 +1412,23 @@ RunService.RenderStepped:Connect(function(dt)
 			state.currentSpeed = state.currentSpeed + (cruiseSpeed - state.currentSpeed) * k
 		end
 
-		-- Crosshair torna al centro
-		state.crosshairOffset = state.crosshairOffset:Lerp(
-			Vector2.zero, 1 - math.exp(-CROSSHAIR_RETURN * dt)
-		)
-
 		local speedRatio = math.clamp(state.currentSpeed / math.max(maxSpeed, 1), 0, 1)
 		local authority  = MIN_AUTHORITY + (1 - MIN_AUTHORITY) * speedRatio
-		local rollInput  = math.clamp(rgtInput + axis(Enum.KeyCode.E, Enum.KeyCode.Q), -1, 1)
+		local rollInput  = math.clamp(rgtInput, -1, 1)
 
-		-- Roll manuale (A/D + Q/E) per barrel/dice roll
-		state.roll = state.roll - rollInput * (ROLL_RATE * authority) * dt
+		-- Rotazione 360° su asse X con A/D
+		state.roll = state.roll + rollInput * (ROLL_RATE * authority) * dt
 		state.roll = math.atan2(math.sin(state.roll), math.cos(state.roll))
 
-		-- Integra yaw/pitch dal crosshair (X negato: mouse destra → gira destra)
-		local cxNorm = -state.crosshairOffset.X / CROSSHAIR_MAX_R
-		local cyNorm =  state.crosshairOffset.Y / CROSSHAIR_MAX_R
-		local function shaped(v)
-			local a = math.abs(v)
-			if a < INPUT_DEADZONE then return 0 end
-			local t = (a - INPUT_DEADZONE) / (1 - INPUT_DEADZONE)
-			return math.sign(v) * (t * t)
+		-- La nave segue il puntatore del mouse
+		local pointerWorld = mouse.Hit and mouse.Hit.Position
+			or (camera.CFrame.Position + camera.CFrame.LookVector * TARGET_RANGE)
+		local toPointer = pointerWorld - shipPos
+		if toPointer.Magnitude > 1e-4 then
+			local aimDir = toPointer.Unit
+			state.aimYaw = math.atan2(aimDir.X, aimDir.Z)
+			state.aimPitch = math.clamp(math.asin(math.clamp(aimDir.Y, -1, 1)), -MAX_PITCH, MAX_PITCH)
 		end
-		local yawInput   = shaped(cxNorm)
-		local pitchInput = shaped(cyNorm)
-		local prevAimYaw = state.aimYaw
-		local bankTurn = math.sin(state.roll + state.bank) * BANK_TURN_ASSIST * math.max(speedRatio, 0.3)
-		state.aimYaw   = state.aimYaw + (yawInput * YAW_RATE * authority + bankTurn) * dt
-		state.aimPitch = math.clamp(state.aimPitch - pitchInput * PITCH_RATE * authority * dt, -MAX_PITCH, MAX_PITCH)
-
-		-- Auto-bank proporzionale al yaw rate (si somma al roll manuale)
-		local yawRate    = (state.aimYaw - prevAimYaw) / math.max(dt, 0.001)
-		local targetBank = -(yawRate / YAW_RATE) * BANK_MAX
-		state.bank = state.bank + (targetBank - state.bank) * (1 - math.exp(-BANK_LAMBDA * dt))
-		state.bank = math.clamp(state.bank, -BANK_MAX, BANK_MAX)
 
 		-- Direzione muso dai Euler
 		local cy = math.cos(state.aimYaw)
@@ -1534,9 +1437,9 @@ RunService.RenderStepped:Connect(function(dt)
 		local sp = math.sin(state.aimPitch)
 		local noseDir = Vector3.new(sy * cp, sp, cy * cp)
 
-		-- Gyro: muso = +LookVector + roll manuale + auto-bank
+		-- Gyro: muso sul puntatore + rotazione locale asse X
 		local baseCF    = CFrame.lookAt(Vector3.zero, noseDir)
-		local targetCF  = baseCF * CFrame.Angles(0, 0, state.roll + state.bank)
+		local targetCF  = baseCF * CFrame.Angles(state.roll, 0, 0)
 		local desiredNoseCF = CFrame.new(shipPos) * (targetCF - targetCF.Position)
 
 		if not state.aimCFrame then
@@ -1637,11 +1540,8 @@ RunService.RenderStepped:Connect(function(dt)
 
 	-- Posizione crosshair UI
 	if state.mode == "combat" and not state.freeLook then
-		local vpSize = camera.ViewportSize
-		HUD.Crosshair.Position = UDim2.new(
-			0, vpSize.X * 0.5 + state.crosshairOffset.X,
-			0, vpSize.Y * 0.5 + state.crosshairOffset.Y
-		)
+		local pointerPos = pointerScreenPosition()
+		HUD.Crosshair.Position = UDim2.new(0, pointerPos.X, 0, pointerPos.Y)
 	end
 
 	-- Replica setpoint al server ~10Hz
