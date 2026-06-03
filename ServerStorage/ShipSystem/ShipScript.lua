@@ -523,6 +523,31 @@ local function spawnLaserInternal(originPos, direction)
 	ldbg("cloning template...")
 	local laser = laserTemplate:Clone()
 	ldbg("clone ok:", laser.ClassName, " transparency=", laser.Transparency, " size=", laser.Size)
+
+	-- Dump dei children del clone (vediamo se Beams/Trail/PointLight sono presenti e Enabled)
+	if LASER_DEBUG then
+		for _, c in ipairs(laser:GetDescendants()) do
+			if c:IsA("Beam") then
+				print(("  [child] Beam %s  Enabled=%s  A0=%s  A1=%s"):format(
+					c:GetFullName(), tostring(c.Enabled),
+					c.Attachment0 and c.Attachment0.Name or "nil",
+					c.Attachment1 and c.Attachment1.Name or "nil"))
+			elseif c:IsA("Trail") then
+				print(("  [child] Trail %s  Enabled=%s"):format(c:GetFullName(), tostring(c.Enabled)))
+			elseif c:IsA("ParticleEmitter") then
+				print(("  [child] ParticleEmitter %s  Enabled=%s  Rate=%s"):format(
+					c:GetFullName(), tostring(c.Enabled), tostring(c.Rate)))
+			elseif c:IsA("Attachment") then
+				print(("  [child] Attachment %s  pos=%s"):format(c.Name, tostring(c.Position)))
+			elseif c:IsA("Light") then
+				print(("  [child] %s  Enabled=%s  Brightness=%s"):format(
+					c.ClassName, tostring(c.Enabled), tostring(c.Brightness)))
+			end
+		end
+	end
+
+	-- IMPORTANTE: NON tocco ne' Transparency ne' Size del clone -- vengono dal
+	-- template e l'utente vuole che restino come sono.
 	laser.Name       = "ShipLaser"
 	laser.Anchored   = false
 	laser.CanCollide = false
