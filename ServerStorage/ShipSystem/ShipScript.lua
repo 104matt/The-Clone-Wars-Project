@@ -583,6 +583,29 @@ local function spawnLaserInternal(originPos, direction)
 	laser.Parent = getBulletsFolder()
 	ldbg("PARENTED in", laser.Parent and laser.Parent:GetFullName() or "<nil>")
 
+	-- DEBUG: traccia ogni cambio di Parent. Se qualcosa sgancia il bullet
+	-- subito dopo il PARENTED, lo becchiamo qui.
+	local ancestryConn
+	ancestryConn = laser.AncestryChanged:Connect(function(_, newParent)
+		ldbg("ANCESTRY change: laser.Parent =", newParent and newParent:GetFullName() or "<nil>")
+		if not newParent then
+			-- L'oggetto e' stato sganciato/distrutto. Ferma il listener.
+			if ancestryConn then ancestryConn:Disconnect() end
+		end
+	end)
+
+	-- DEBUG: dopo 1s controlla se e' ancora vivo e dove sta.
+	task.delay(1, function()
+		if laser and laser.Parent then
+			ldbg(("ALIVE@1s: parent=%s  pos=%s  vel=%s"):format(
+				laser.Parent:GetFullName(),
+				tostring(laser.Position),
+				tostring(laser.AssemblyLinearVelocity)))
+		else
+			ldbg("DEAD@1s: il laser e' stato distrutto entro 1 secondo")
+		end
+	end)
+
 	local conn
 	conn = laser.Touched:Connect(function(other)
 		if other:IsDescendantOf(ship) then return end
