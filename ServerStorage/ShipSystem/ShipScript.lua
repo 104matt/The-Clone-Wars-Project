@@ -469,6 +469,9 @@ local BULLETS_FOLDER_NAME = "ShipBullets"
 -- Mettilo a false una volta sistemato lo sparo. Quando true stampa ogni step
 -- di spawnLaser per individuare dove muore.
 local LASER_DEBUG    = true
+-- Quando true, il bullet NON viene distrutto da Touched: utile per vedere se
+-- arriva almeno a comparire. Stampa pero' cosa lo avrebbe colpito.
+local LASER_NO_DESTROY = true
 local function ldbg(...)
 	if LASER_DEBUG then print("[ShipScript][" .. ship.Name .. "][LASER]", ...) end
 end
@@ -585,11 +588,16 @@ local function spawnLaserInternal(originPos, direction)
 		if other:IsDescendantOf(ship) then return end
 		-- Ignora altri proiettili nella stessa cartella (evita auto-distruzioni).
 		if other.Parent and other.Parent.Name == BULLETS_FOLDER_NAME then return end
+
+		ldbg("TOUCHED other=", other:GetFullName(), "  (would destroy)")
+
 		local model = other:FindFirstAncestorOfClass("Model")
 		local hum   = model and model:FindFirstChildOfClass("Humanoid")
 		if hum and hum.Health > 0 then
 			hum:TakeDamage(CONFIG.Damage)
 		end
+
+		if LASER_NO_DESTROY then return end  -- DEBUG: lascia vivere il bullet
 		if conn then conn:Disconnect() end
 		laser:Destroy()
 	end)
