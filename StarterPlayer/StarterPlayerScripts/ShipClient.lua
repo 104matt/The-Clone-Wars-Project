@@ -49,19 +49,21 @@ local HANGAR_SPEED      = 20      -- studs/sec max in hangar
 local HANGAR_TURN_RATE  = 1.4     -- rad/sec yaw A/D in hangar
 local HANGAR_ACCEL      = 30      -- accel/brake rate in hangar
 
-local CROSSHAIR_MAX_R   = 300     -- pixel: deflessione massima crosshair
-local CROSSHAIR_SENS    = 1.0     -- moltiplicatore sensibilita' mouse
-local CROSSHAIR_RETURN  = 3.0     -- lambda ritorno al centro
+local CROSSHAIR_MAX_R   = 260     -- pixel: deflessione massima crosshair
+local CROSSHAIR_SENS    = 0.92    -- moltiplicatore sensibilita' mouse
+local CROSSHAIR_RETURN  = 4.2     -- lambda ritorno al centro
 
-local YAW_RATE          = 2.1     -- rad/sec alla deflessione massima
-local PITCH_RATE        = 1.7
-local MAX_PITCH         = math.rad(80)
+local YAW_RATE          = 2.6     -- rad/sec alla deflessione massima
+local PITCH_RATE        = 2.2
+local MAX_PITCH         = math.rad(75)
 
-local BANK_MAX          = math.rad(60)
-local BANK_LAMBDA       = 4
-local ROLL_RATE         = 2.2     -- rad/sec A/D in combat (dice roll)
-local AIM_LAMBDA        = 6
-local DRIFT_LAMBDA      = 2.4
+local BANK_MAX          = math.rad(70)
+local BANK_LAMBDA       = 5.5
+local ROLL_RATE         = 3.4     -- rad/sec A/D in combat (dice roll)
+local AIM_LAMBDA        = 8
+local DRIFT_LAMBDA      = 3.1
+local BANK_TURN_ASSIST  = 0.95    -- curva in base al bank (stile arcade)
+local MIN_AUTHORITY     = 0.45    -- controllo minimo a bassa velocita'
 
 local TARGET_RANGE      = 1500
 local TARGET_CONE       = math.cos(math.rad(38))
@@ -1240,15 +1242,21 @@ RunService.RenderStepped:Connect(function(dt)
 			Vector2.zero, 1 - math.exp(-CROSSHAIR_RETURN * dt)
 		)
 
-		-- Roll manuale A/D (continuo, 360° liberi)
-		state.roll = state.roll - rgtInput * ROLL_RATE * dt
+		local speedRatio = math.clamp(state.currentSpeed / math.max(maxSpeed, 1), 0, 1)
+		local authority  = MIN_AUTHORITY + (1 - MIN_AUTHORITY) * speedRatio
+		local rollInput  = math.clamp(rgtInput + axis(Enum.KeyCode.E, Enum.KeyCode.Q), -1, 1)
+
+		-- Roll manuale (A/D + Q/E) per barrel/dice roll
+		state.roll = state.roll - rollInput * (ROLL_RATE * authority) * dt
+		state.roll = math.atan2(math.sin(state.roll), math.cos(state.roll))
 
 		-- Integra yaw/pitch dal crosshair (X negato: mouse destra → gira destra)
 		local cxNorm = -state.crosshairOffset.X / CROSSHAIR_MAX_R
 		local cyNorm =  state.crosshairOffset.Y / CROSSHAIR_MAX_R
 		local prevAimYaw = state.aimYaw
-		state.aimYaw   = state.aimYaw   + cxNorm * YAW_RATE  * dt
-		state.aimPitch = math.clamp(state.aimPitch - cyNorm * PITCH_RATE * dt, -MAX_PITCH, MAX_PITCH)
+		local bankTurn = math.sin(state.roll + state.bank) * BANK_TURN_ASSIST * speedRatio
+		state.aimYaw   = state.aimYaw + (cxNorm * YAW_RATE * authority + bankTurn) * dt
+		state.aimPitch = math.clamp(state.aimPitch - cyNorm * PITCH_RATE * authority * dt, -MAX_PITCH, MAX_PITCH)
 
 		-- Auto-bank proporzionale al yaw rate (si somma al roll manuale)
 		local yawRate    = (state.aimYaw - prevAimYaw) / math.max(dt, 0.001)
