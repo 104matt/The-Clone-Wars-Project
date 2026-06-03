@@ -49,21 +49,24 @@ local HANGAR_SPEED      = 20      -- studs/sec max in hangar
 local HANGAR_TURN_RATE  = 1.4     -- rad/sec yaw A/D in hangar
 local HANGAR_ACCEL      = 30      -- accel/brake rate in hangar
 
-local CROSSHAIR_MAX_R   = 260     -- pixel: deflessione massima crosshair
-local CROSSHAIR_SENS    = 0.92    -- moltiplicatore sensibilita' mouse
-local CROSSHAIR_RETURN  = 4.2     -- lambda ritorno al centro
+local CROSSHAIR_MAX_R   = 230     -- pixel: deflessione massima crosshair
+local CROSSHAIR_SENS    = 0.9     -- moltiplicatore sensibilita' mouse
+local CROSSHAIR_RETURN  = 4.8     -- lambda ritorno al centro
 
-local YAW_RATE          = 2.6     -- rad/sec alla deflessione massima
-local PITCH_RATE        = 2.2
+local YAW_RATE          = 2.3     -- rad/sec alla deflessione massima
+local PITCH_RATE        = 2.6
 local MAX_PITCH         = math.rad(75)
 
-local BANK_MAX          = math.rad(70)
-local BANK_LAMBDA       = 5.5
-local ROLL_RATE         = 3.4     -- rad/sec A/D in combat (dice roll)
-local AIM_LAMBDA        = 8
-local DRIFT_LAMBDA      = 3.1
-local BANK_TURN_ASSIST  = 0.95    -- curva in base al bank (stile arcade)
+local BANK_MAX          = math.rad(78)
+local BANK_LAMBDA       = 6.2
+local ROLL_RATE         = 4.4     -- rad/sec A/D in combat (dice roll)
+local AIM_LAMBDA        = 9
+local DRIFT_LAMBDA      = 3.8
+local BANK_TURN_ASSIST  = 1.25    -- curva in base al bank (stile arcade)
 local MIN_AUTHORITY     = 0.45    -- controllo minimo a bassa velocita'
+local COMBAT_CRUISE_PCT = 0.38    -- throttle base in combat
+local COMBAT_CRUISE_PULL = 0.9    -- ritorno verso cruise senza input
+local INPUT_DEADZONE    = 0.08
 
 local TARGET_RANGE      = 1500
 local TARGET_CONE       = math.cos(math.rad(38))
@@ -1231,10 +1234,14 @@ RunService.RenderStepped:Connect(function(dt)
 		-- ----------------------------------------------------------------
 		-- COMBAT: crosshair → yaw/pitch Euler → gyro, auto-bank, deriva
 		-- ----------------------------------------------------------------
+		local cruiseSpeed = maxSpeed * COMBAT_CRUISE_PCT
 		if fwdInput > 0 then
 			state.currentSpeed = math.min(state.currentSpeed + maxSpeed * 0.7 * dt, maxSpeed)
 		elseif fwdInput < 0 then
-			state.currentSpeed = math.max(state.currentSpeed - maxSpeed * 1.4 * dt, 0)
+			state.currentSpeed = math.max(state.currentSpeed - maxSpeed * 1.4 * dt, cruiseSpeed * 0.35)
+		else
+			local k = 1 - math.exp(-COMBAT_CRUISE_PULL * dt)
+			state.currentSpeed = state.currentSpeed + (cruiseSpeed - state.currentSpeed) * k
 		end
 
 		-- Crosshair torna al centro
@@ -1253,10 +1260,18 @@ RunService.RenderStepped:Connect(function(dt)
 		-- Integra yaw/pitch dal crosshair (X negato: mouse destra → gira destra)
 		local cxNorm = -state.crosshairOffset.X / CROSSHAIR_MAX_R
 		local cyNorm =  state.crosshairOffset.Y / CROSSHAIR_MAX_R
+		local function shaped(v)
+			local a = math.abs(v)
+			if a < INPUT_DEADZONE then return 0 end
+			local t = (a - INPUT_DEADZONE) / (1 - INPUT_DEADZONE)
+			return math.sign(v) * (t * t)
+		end
+		local yawInput   = shaped(cxNorm)
+		local pitchInput = shaped(cyNorm)
 		local prevAimYaw = state.aimYaw
-		local bankTurn = math.sin(state.roll + state.bank) * BANK_TURN_ASSIST * speedRatio
-		state.aimYaw   = state.aimYaw + (cxNorm * YAW_RATE * authority + bankTurn) * dt
-		state.aimPitch = math.clamp(state.aimPitch - cyNorm * PITCH_RATE * authority * dt, -MAX_PITCH, MAX_PITCH)
+		local bankTurn = math.sin(state.roll + state.bank) * BANK_TURN_ASSIST * math.max(speedRatio, 0.3)
+		state.aimYaw   = state.aimYaw + (yawInput * YAW_RATE * authority + bankTurn) * dt
+		state.aimPitch = math.clamp(state.aimPitch - pitchInput * PITCH_RATE * authority * dt, -MAX_PITCH, MAX_PITCH)
 
 		-- Auto-bank proporzionale al yaw rate (si somma al roll manuale)
 		local yawRate    = (state.aimYaw - prevAimYaw) / math.max(dt, 0.001)
