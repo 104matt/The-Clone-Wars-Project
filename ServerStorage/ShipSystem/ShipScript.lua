@@ -267,6 +267,13 @@ end
 -- ============================================================================
 local sfoilTrails = {}
 
+-- Tuning del trail stile film: scia bianca sottile e breve, molto luminosa.
+-- Se non ti torna, regola questi numeri in cima alla funzione.
+local SFOIL_TRAIL_SPAN_FRAC = 0.45  -- distanza tra i due Attachment (0..1 della Y della part). Piu' alto = scia piu' "spessa"
+local SFOIL_TRAIL_LIFETIME  = 0.45  -- durata della scia (s). Piu' alto = scia piu' lunga
+local SFOIL_TRAIL_WIDTH     = 0.6   -- WidthScale di partenza
+local SFOIL_TRAIL_FACECAM   = true  -- guarda sempre la camera (look "movie")
+
 local function buildSfoilTrail(part)
 	local sz  = part.Size
 	local at0 = part:FindFirstChild("SfoilTrailA0")
@@ -275,7 +282,7 @@ local function buildSfoilTrail(part)
 		at0.Name   = "SfoilTrailA0"
 		at0.Parent = part
 	end
-	at0.Position = Vector3.new(0,  sz.Y / 2 * 0.85, sz.Z / 2)
+	at0.Position = Vector3.new(0,  sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
 
 	local at1 = part:FindFirstChild("SfoilTrailA1")
 	if not at1 then
@@ -283,7 +290,7 @@ local function buildSfoilTrail(part)
 		at1.Name   = "SfoilTrailA1"
 		at1.Parent = part
 	end
-	at1.Position = Vector3.new(0, -sz.Y / 2 * 0.85, sz.Z / 2)
+	at1.Position = Vector3.new(0, -sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
 
 	local trail = part:FindFirstChild("SfoilTrail")
 	if not trail or not trail:IsA("Trail") then
@@ -294,27 +301,33 @@ local function buildSfoilTrail(part)
 	end
 	trail.Attachment0 = at0
 	trail.Attachment1 = at1
-	-- Scia bianca con sfumatura cyan ai bordi (stile X-wing / ARC-170 nei film)
+
+	-- Colore: pure white core con velo cyan tenue verso la coda
 	trail.Color = ColorSequence.new({
 		ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
-		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(180, 230, 255)),
-		ColorSequenceKeypoint.new(1,   Color3.fromRGB(70,  140, 230)),
+		ColorSequenceKeypoint.new(0.6, Color3.fromRGB(220, 240, 255)),
+		ColorSequenceKeypoint.new(1,   Color3.fromRGB(150, 200, 255)),
 	})
+
+	-- Transparency: parte quasi opaca, sfuma rapidamente a invisibile
 	trail.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0,   0.1),
-		NumberSequenceKeypoint.new(0.7, 0.65),
-		NumberSequenceKeypoint.new(1,   1),
+		NumberSequenceKeypoint.new(0,    0.05),
+		NumberSequenceKeypoint.new(0.35, 0.4),
+		NumberSequenceKeypoint.new(1,    1),
 	})
+
+	-- WidthScale: triangolare, parte sottile e finisce a punta
 	trail.WidthScale = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0, SFOIL_TRAIL_WIDTH),
 		NumberSequenceKeypoint.new(1, 0),
 	})
-	trail.Lifetime       = 0.8
+
+	trail.Lifetime       = SFOIL_TRAIL_LIFETIME
 	trail.MinLength      = 0
 	trail.MaxLength      = 0
-	trail.LightEmission  = 1
+	trail.LightEmission  = 1            -- pieno glow (richiesto per il look "cinema")
 	trail.LightInfluence = 0
-	trail.FaceCamera     = true
+	trail.FaceCamera     = SFOIL_TRAIL_FACECAM
 	trail.Enabled        = false
 	return trail
 end
@@ -445,6 +458,32 @@ end)
 local LASER_SPEED    = 750
 local LASER_LIFETIME = 5
 local lastShot       = 0
+local BULLETS_FOLDER_NAME = "ShipBullets"
+
+local function getBulletsFolder()
+	local f = Workspace:FindFirstChild(BULLETS_FOLDER_NAME)
+	if not f then
+		f        = Instance.new("Folder")
+		f.Name   = BULLETS_FOLDER_NAME
+		f.Parent = Workspace
+	end
+	return f
+end
+
+-- Debug: stampa una sola volta lo stato del template a runtime cosi' vediamo
+-- se la nave trova LaserBolt e da dove.
+local debugAnnounced = false
+local function announceTemplateOnce()
+	if debugAnnounced then return end
+	debugAnnounced = true
+	if laserTemplate then
+		print(("[ShipScript][%s] LaserBolt template trovato: %s")
+			:format(ship.Name, laserTemplate:GetFullName()))
+	else
+		warn(("[ShipScript][%s] LaserBolt template NON trovato (cerco FlightEvents.%s.LaserBolt).")
+			:format(ship.Name, ship.Name))
+	end
+end
 
 -- Il template del proiettile sta in ReplicatedStorage.FlightEvents.LaserBolt.
 -- Lo cloniamo, lo orientiamo verso la direzione di tiro, gli appiccichiamo
@@ -454,6 +493,7 @@ local function spawnLaser(originPos, direction)
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
 		laserTemplate = resolveLaserTemplate()
 	end
+	announceTemplateOnce()
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
 		warn(("[ShipScript] %s: LaserBolt non trovato (cerco FlightEvents.%s.LaserBolt)."):format(ship.Name, ship.Name))
 		return
@@ -487,11 +527,13 @@ local function spawnLaser(originPos, direction)
 	lv.VectorVelocity = direction * LASER_SPEED
 	lv.Parent         = laser
 
-	laser.Parent = Workspace
+	laser.Parent = getBulletsFolder()
 
 	local conn
 	conn = laser.Touched:Connect(function(other)
 		if other:IsDescendantOf(ship) then return end
+		-- Ignora altri proiettili nella stessa cartella (evita auto-distruzioni).
+		if other.Parent and other.Parent.Name == BULLETS_FOLDER_NAME then return end
 		local model = other:FindFirstAncestorOfClass("Model")
 		local hum   = model and model:FindFirstChildOfClass("Humanoid")
 		if hum and hum.Health > 0 then
