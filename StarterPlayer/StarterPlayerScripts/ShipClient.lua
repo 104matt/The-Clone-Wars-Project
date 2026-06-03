@@ -359,6 +359,109 @@ local function buildHud()
 	})
 	corner(boostBarFill, 3)
 
+	-- ---- TOP-LEFT (sotto Boost): Vitals (Shields + Hull) -----------------
+	local vitalsCard = new("Frame", {
+		Name                   = "Vitals",
+		Position               = UDim2.fromOffset(28, 28 + 96 + 8 + 28 + 8),
+		Size                   = UDim2.fromOffset(280, 50),
+		BackgroundColor3       = PALETTE.panel,
+		BackgroundTransparency = 0.3,
+		BorderSizePixel        = 0,
+		Parent                 = gui,
+	})
+	corner(vitalsCard, 4)
+	stroke(vitalsCard, PALETTE.primaryDim, 1, 0.3)
+
+	local function vitalsRow(y, label, color)
+		new("TextLabel", {
+			Position               = UDim2.fromOffset(12, y),
+			Size                   = UDim2.fromOffset(60, 14),
+			BackgroundTransparency = 1,
+			Font                   = Enum.Font.GothamBold,
+			TextSize               = 10,
+			TextColor3             = PALETTE.textDim,
+			TextXAlignment         = Enum.TextXAlignment.Left,
+			Text                   = label,
+			Parent                 = vitalsCard,
+		})
+		local bg = new("Frame", {
+			Position               = UDim2.fromOffset(72, y + 2),
+			Size                   = UDim2.new(1, -84, 0, 8),
+			BackgroundColor3       = PALETTE.bg,
+			BorderSizePixel        = 0,
+			Parent                 = vitalsCard,
+		})
+		corner(bg, 3)
+		local fill = new("Frame", {
+			Size                   = UDim2.fromScale(1, 1),
+			BackgroundColor3       = color,
+			BorderSizePixel        = 0,
+			Parent                 = bg,
+		})
+		corner(fill, 3)
+		return fill
+	end
+
+	local shieldsFill = vitalsRow(6,  "SHIELDS", PALETTE.primary)
+	local healthFill  = vitalsRow(28, "HULL",    PALETTE.good)
+
+	-- ---- Lock-on bracket (overlay sopra il target) ----------------------
+	local lockBracket = new("Frame", {
+		Name                   = "LockBracket",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Size                   = UDim2.fromOffset(60, 60),
+		BackgroundTransparency = 1,
+		Visible                = false,
+		Parent                 = gui,
+	})
+	-- 4 angoli del bracket
+	for _, corner_data in ipairs({
+		{ Vector2.new(0, 0), 0,   0   },  -- top-left
+		{ Vector2.new(1, 0), 1,   0   },  -- top-right
+		{ Vector2.new(0, 1), 0,   1   },  -- bottom-left
+		{ Vector2.new(1, 1), 1,   1   },  -- bottom-right
+	}) do
+		local anchor, sx, sy = corner_data[1], corner_data[2], corner_data[3]
+		-- linea orizzontale
+		new("Frame", {
+			AnchorPoint            = anchor,
+			Position               = UDim2.fromScale(sx, sy),
+			Size                   = UDim2.fromOffset(14, 2),
+			BackgroundColor3       = PALETTE.danger,
+			BorderSizePixel        = 0,
+			Parent                 = lockBracket,
+		})
+		-- linea verticale
+		new("Frame", {
+			AnchorPoint            = anchor,
+			Position               = UDim2.fromScale(sx, sy),
+			Size                   = UDim2.fromOffset(2, 14),
+			BackgroundColor3       = PALETTE.danger,
+			BorderSizePixel        = 0,
+			Parent                 = lockBracket,
+		})
+	end
+
+	-- Lead reticle: punto predittivo dove sparare per colpire il target.
+	local leadReticle = new("Frame", {
+		Name                   = "LeadReticle",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Size                   = UDim2.fromOffset(14, 14),
+		BackgroundTransparency = 1,
+		Visible                = false,
+		Parent                 = gui,
+	})
+	stroke(leadReticle, PALETTE.accent, 1.5, 0)
+	corner(leadReticle, 999)
+	new("Frame", {
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Position               = UDim2.fromScale(0.5, 0.5),
+		Size                   = UDim2.fromOffset(2, 2),
+		BackgroundColor3       = PALETTE.accent,
+		BorderSizePixel        = 0,
+		Parent                 = leadReticle,
+	})
+
 	-- ---- BOTTOM-LEFT: Speedometer ----------------------------------------
 	local speedCard = new("Frame", {
 		Name                   = "Speed",
@@ -436,7 +539,7 @@ local function buildHud()
 		Name                   = "Controls",
 		AnchorPoint            = Vector2.new(1, 1),
 		Position               = UDim2.new(1, -28, 1, -28 - 240 - 12),
-		Size                   = UDim2.fromOffset(180, 314),  -- aumentato per ospitare V e SHIFT
+		Size                   = UDim2.fromOffset(180, 344),  -- aumentato per ospitare V, SHIFT, TAB
 		BackgroundColor3       = PALETTE.panel,
 		BackgroundTransparency = 0.25,
 		BorderSizePixel        = 0,
@@ -531,10 +634,11 @@ local function buildHud()
 	local qeRow = nil  -- riga Q/E ora sempre visibile (vale anche in flight)
 	controlRow(5,  "SHIFT", "Boost")
 	controlRow(6,  "V",     "Free Cam")
-	controlRow(7,  "N",     "Toggle Mode")
-	controlRow(8,  "LMB",   "Fire")
-	controlRow(9,  "RMB",   "Zoom Aim")
-	controlRow(10, "WHEEL", "Cam Zoom")
+	controlRow(7,  "TAB",   "Lock Target")
+	controlRow(8,  "N",     "Toggle Mode")
+	controlRow(9,  "LMB",   "Fire")
+	controlRow(10, "RMB",   "Zoom Aim")
+	controlRow(11, "WHEEL", "Cam Zoom")
 
 	-- ---- BOTTOM-RIGHT: Altitude ------------------------------------------
 	local altCard = new("Frame", {
@@ -745,6 +849,10 @@ local function buildHud()
 		ControlsCard   = ctrlCard,
 		QERow          = qeRow,
 		BoostFill      = boostBarFill,
+		ShieldsFill    = shieldsFill,
+		HealthFill     = healthFill,
+		LockBracket    = lockBracket,
+		LeadReticle    = leadReticle,
 	}
 end
 
@@ -818,6 +926,12 @@ local RECOIL_DECAY        = 11     -- lambda damping del recoil verso zero
 local RECOIL_MAX_BACK     = 2.5    -- cap del kick accumulato
 local RECOIL_MAX_PITCH    = 0.09
 
+-- Lock-on (Tab cicla i target nemici)
+local LOCK_RANGE      = 1500    -- studs max per acquisire target
+local LOCK_CONE_DEG   = 35      -- angolo max dal muso per acquisire
+local LOCK_LOSE_DEG   = 60      -- se va oltre questo angolo, perdi il lock
+local LOCK_LASER_SPEED = 750    -- deve combaciare con LASER_SPEED del server
+
 -- Free cam (V per toggle chase <-> free orbit)
 -- In free cam la nave mantiene la rotta corrente (heading bloccato), il mouse
 -- ruota la camera attorno alla nave (yaw + pitch), il wheel regola la distanza.
@@ -876,6 +990,18 @@ local state = {
 	-- shooting
 	shooting       = false,
 	lastShot       = -math.huge,
+
+	-- lock-on (Tab cicla)
+	lockedTarget   = nil,        -- Model nave bloccata
+	lockedHrp      = nil,        -- BasePart usato per tracking velocita'
+	lockLastPos    = nil,        -- per stimare velocita' del target
+	lockLastT      = 0,
+	lockedVelocity = Vector3.zero,
+	leadPoint      = nil,        -- Vector3 del punto predittivo (per sparare)
+
+	-- vitals tracking (per flash quando vieni colpito)
+	prevShields    = math.huge,
+	prevHealth     = math.huge,
 
 	config = { Damage = 30, MaxSpeed = 150, ReloadSpeed = 0.18, CanHover = false, FireSound = "" },
 }
@@ -966,6 +1092,15 @@ local function startFlight(ship, seat)
 	state.boostActive  = false
 	state.boostFactor  = 1
 
+	-- reset lock e vitals
+	state.lockedTarget   = nil
+	state.lockedHrp      = nil
+	state.lockLastPos    = nil
+	state.lockedVelocity = Vector3.zero
+	state.leadPoint      = nil
+	state.prevShields    = ship:GetAttribute("MaxShields") or 100
+	state.prevHealth     = ship:GetAttribute("MaxHealth")  or 100
+
 	readShipConfig(ship)
 
 	-- HUD: setup + reveal
@@ -976,7 +1111,7 @@ local function startFlight(ship, seat)
 	HUD.Gui.Enabled       = true
 
 	-- Reveal animation (telemetry slides in)
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost", "Vitals" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then
 			local target = card.Position
@@ -1004,7 +1139,7 @@ local function stopFlight()
 	state.boostActive = false
 
 	-- HUD fade out
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost", "Vitals" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then tween(card, 0.2, { BackgroundTransparency = 1 }) end
 	end
@@ -1017,6 +1152,127 @@ local function stopFlight()
 	state.primary  = nil
 	state.gyro     = nil
 	state.velocity = nil
+end
+
+-- ============================================================================
+-- LOCK-ON
+-- ============================================================================
+
+-- Trova tutte le navi (Model con VehicleSeat) diverse dalla nostra entro raggio.
+local function gatherShipTargets()
+	local out = {}
+	if not state.primary then return out end
+	local origin = state.primary.Position
+	for _, m in ipairs(Workspace:GetChildren()) do
+		if m:IsA("Model") and m ~= state.ship then
+			local seat = m:FindFirstChildWhichIsA("VehicleSeat", true)
+			if seat then
+				local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+				if prim then
+					local d = (prim.Position - origin).Magnitude
+					if d <= LOCK_RANGE then
+						table.insert(out, { model = m, prim = prim, dist = d })
+					end
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a.dist < b.dist end)
+	return out
+end
+
+-- Restituisce true se il target e' nel cono frontale (entro maxDeg).
+local function inCone(targetPos, maxDeg)
+	if not state.primary then return false end
+	local fwd = (-state.primary.CFrame.LookVector)  -- muso
+	local dir = (targetPos - state.primary.Position)
+	if dir.Magnitude < 1e-3 then return true end
+	local cos = fwd.Unit:Dot(dir.Unit)
+	return cos >= math.cos(math.rad(maxDeg))
+end
+
+local function cycleLockTarget()
+	if not state.primary then return end
+	local targets = gatherShipTargets()
+	if #targets == 0 then
+		state.lockedTarget = nil
+		state.lockedHrp    = nil
+		return
+	end
+
+	-- Filtra al cono di acquisizione
+	local visible = {}
+	for _, t in ipairs(targets) do
+		if inCone(t.prim.Position, LOCK_CONE_DEG) then
+			table.insert(visible, t)
+		end
+	end
+	if #visible == 0 then
+		state.lockedTarget = nil
+		state.lockedHrp    = nil
+		return
+	end
+
+	-- Trova l'indice del lock corrente e prendi il successivo
+	local currentIdx = 0
+	for i, t in ipairs(visible) do
+		if t.model == state.lockedTarget then currentIdx = i break end
+	end
+	local nextIdx = (currentIdx % #visible) + 1
+	local pick = visible[nextIdx]
+	state.lockedTarget   = pick.model
+	state.lockedHrp      = pick.prim
+	state.lockLastPos    = pick.prim.Position
+	state.lockLastT      = os.clock()
+	state.lockedVelocity = Vector3.zero
+end
+
+-- Aggiorna stima velocita' del target lockato + calcola lead point.
+local function updateLockTracking(dt)
+	local hrp = state.lockedHrp
+	if not hrp or not hrp.Parent then
+		state.lockedTarget = nil
+		state.lockedHrp    = nil
+		state.leadPoint    = nil
+		return
+	end
+
+	-- Se uscito dal cono di mantenimento, perdi il lock
+	if not inCone(hrp.Position, LOCK_LOSE_DEG) then
+		state.lockedTarget = nil
+		state.lockedHrp    = nil
+		state.leadPoint    = nil
+		return
+	end
+
+	-- Stima velocita' (smoothed)
+	local now = os.clock()
+	if state.lockLastPos then
+		local elapsed = math.max(now - state.lockLastT, 1e-3)
+		local v = (hrp.Position - state.lockLastPos) / elapsed
+		state.lockedVelocity = state.lockedVelocity:Lerp(v, 0.35)
+	end
+	state.lockLastPos = hrp.Position
+	state.lockLastT   = now
+
+	-- Lead point: dove il bullet incontrera' il target (assumendo velocita' costante).
+	-- Distanza nave -> target / velocita' proiettile = tempo di volo
+	-- Lead = targetPos + targetVel * tempo
+	local origin = state.primary.Position
+	local toTarget = hrp.Position - origin
+	local dist = toTarget.Magnitude
+	if dist < 1e-3 or LOCK_LASER_SPEED <= 0 then
+		state.leadPoint = hrp.Position
+		return
+	end
+	local tflight = dist / LOCK_LASER_SPEED
+	state.leadPoint = hrp.Position + state.lockedVelocity * tflight
+end
+
+-- Proietta un punto 3D su 2D schermo. Restituisce x, y, onScreen.
+local function worldToScreen(pos)
+	local screenPt, onScreen = camera:WorldToScreenPoint(pos)
+	return screenPt.X, screenPt.Y, onScreen and screenPt.Z > 0
 end
 
 -- ============================================================================
@@ -1339,6 +1595,54 @@ RunService.RenderStepped:Connect(function(dt)
 
 	-- Reticle: in hover non aiming col cursore, smorziamo il reticolo
 	HUD.Reticle.Visible = (state.mode == "flight")
+
+	-- ============ VITALS (shields/hp) =====================================
+	local maxS = state.ship:GetAttribute("MaxShields")    or 100
+	local maxH = state.ship:GetAttribute("MaxHealth")     or 100
+	local curS = state.ship:GetAttribute("CurrentShields") or maxS
+	local curH = state.ship:GetAttribute("CurrentHealth")  or maxH
+	HUD.ShieldsFill.Size = UDim2.new(math.clamp(curS / math.max(maxS, 1), 0, 1), 0, 1, 0)
+	HUD.HealthFill.Size  = UDim2.new(math.clamp(curH / math.max(maxH, 1), 0, 1), 0, 1, 0)
+	-- Colore HP cambia secondo la soglia
+	if curH / math.max(maxH, 1) <= 0.3 then
+		HUD.HealthFill.BackgroundColor3 = PALETTE.danger
+	elseif curH / math.max(maxH, 1) <= 0.6 then
+		HUD.HealthFill.BackgroundColor3 = PALETTE.accent
+	else
+		HUD.HealthFill.BackgroundColor3 = PALETTE.good
+	end
+	-- Flash rosso quando vieni colpito
+	if curS < state.prevShields - 0.01 or curH < state.prevHealth - 0.01 then
+		flashHit()
+	end
+	state.prevShields = curS
+	state.prevHealth  = curH
+
+	-- ============ LOCK-ON =================================================
+	updateLockTracking(dt)
+	if state.lockedHrp and state.lockedHrp.Parent then
+		local tx, ty, on1 = worldToScreen(state.lockedHrp.Position)
+		if on1 then
+			HUD.LockBracket.Visible  = true
+			HUD.LockBracket.Position = UDim2.fromOffset(tx, ty)
+		else
+			HUD.LockBracket.Visible = false
+		end
+		if state.leadPoint then
+			local lx, ly, on2 = worldToScreen(state.leadPoint)
+			if on2 then
+				HUD.LeadReticle.Visible  = true
+				HUD.LeadReticle.Position = UDim2.fromOffset(lx, ly)
+			else
+				HUD.LeadReticle.Visible = false
+			end
+		else
+			HUD.LeadReticle.Visible = false
+		end
+	else
+		HUD.LockBracket.Visible = false
+		HUD.LeadReticle.Visible = false
+	end
 end)
 
 -- ============================================================================
@@ -1352,10 +1656,14 @@ local function tryShoot()
 	if now - state.lastShot < state.config.ReloadSpeed then return end
 	state.lastShot = now
 
-	-- In free cam non si mira col mouse (e' bloccato a orbitare la camera):
-	-- i proiettili escono lungo il muso (-LookVector del PrimaryPart).
+	-- Direzione di tiro:
+	--   1) se lock-on attivo -> verso il lead point (mira predittiva)
+	--   2) free cam          -> lungo il muso
+	--   3) chase normale     -> verso mouse.Hit
 	local dir
-	if state.camView == "free" then
+	if state.leadPoint and state.lockedHrp and state.lockedHrp.Parent then
+		dir = (state.leadPoint - state.primary.Position).Unit
+	elseif state.camView == "free" then
 		dir = (-state.primary.CFrame.LookVector).Unit
 	else
 		local targetPos = mouse.Hit.Position
@@ -1400,6 +1708,10 @@ UserInputService.InputBegan:Connect(function(input, processed)
 			state.aimCFrame = state.primary and state.primary.CFrame or nil
 		end
 		ShipEvent:FireServer("EngineToggle", { State = state.engineOn })
+
+	elseif input.KeyCode == Enum.KeyCode.Tab then
+		-- Tab cicla i target nemici nel cono frontale.
+		if state.ship then cycleLockTarget() end
 
 	elseif input.KeyCode == Enum.KeyCode.V then
 		-- Toggle vista: chase <-> free orbit. Solo in flight (hover ha gia' free orbit).

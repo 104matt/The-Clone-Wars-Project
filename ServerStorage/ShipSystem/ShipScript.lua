@@ -95,12 +95,6 @@ local cameraPart = ship:FindFirstChild("CameraPart", true)
 local zoomPart   = ship:FindFirstChild("ZoomPart",   true)
 local laser1     = ship:FindFirstChild("Laser1",     true)
 local laser2     = ship:FindFirstChild("Laser2",     true)
-
-print(("[ShipScript][%s] BOOT  Laser1=%s  Laser2=%s"):format(
-	ship.Name,
-	laser1 and laser1:GetFullName() or "MISSING",
-	laser2 and laser2:GetFullName() or "MISSING"
-))
 local leftWing   = ship:FindFirstChild("LeftWing",      true)
 local rightWing  = ship:FindFirstChild("RightWing",     true)
 local openLeft   = ship:FindFirstChild("OpenLeftWing",  true)
@@ -459,22 +453,65 @@ vehicleSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
 end)
 
 -- ============================================================================
+-- SHIP HEALTH / SHIELDS
+-- ============================================================================
+-- Stato di vita della nave, replicato al client tramite Attributi:
+--   MaxHealth, MaxShields            -> tetto (lettura)
+--   CurrentHealth, CurrentShields    -> stato vivo (server scrive, client legge)
+-- Tuning live: modificabile da Studio come Attributes del Model.
+local MAX_HEALTH         = attr("MaxHealth",        100)
+local MAX_SHIELDS        = attr("MaxShields",       100)
+local SHIELD_REGEN_DELAY = attr("ShieldRegenDelay", 4)   -- s dopo l'ultimo hit
+local SHIELD_REGEN_RATE  = attr("ShieldRegenRate",  20)  -- punti/s
+
+ship:SetAttribute("MaxHealth",      MAX_HEALTH)
+ship:SetAttribute("MaxShields",     MAX_SHIELDS)
+ship:SetAttribute("CurrentHealth",  MAX_HEALTH)
+ship:SetAttribute("CurrentShields", MAX_SHIELDS)
+
+local lastHitClock = -math.huge
+local lastShieldsSeen = MAX_SHIELDS
+local lastHealthSeen  = MAX_HEALTH
+
+-- Quando un'altra nave/colpo riduce i nostri scudi o scafo via Attribute,
+-- consideriamo il momento come "ultimo hit" -> blocca regen per SHIELD_REGEN_DELAY.
+ship:GetAttributeChangedSignal("CurrentShields"):Connect(function()
+	local v = ship:GetAttribute("CurrentShields") or 0
+	if v < lastShieldsSeen then lastHitClock = os.clock() end
+	lastShieldsSeen = v
+end)
+ship:GetAttributeChangedSignal("CurrentHealth"):Connect(function()
+	local v = ship:GetAttribute("CurrentHealth") or 0
+	if v < lastHealthSeen then lastHitClock = os.clock() end
+	lastHealthSeen = v
+	if v <= 0 then
+		-- TODO: morte/esplosione nave. Per ora la nave resta, da implementare.
+		-- (lasciamo i scudi/HP a 0 finche' non si rigenerano dopo il delay).
+	end
+end)
+
+-- Regen scudi: se da SHIELD_REGEN_DELAY non c'e' stato un hit, ricarica.
+task.spawn(function()
+	while ship.Parent do
+		task.wait(0.25)
+		local now = os.clock()
+		if now - lastHitClock >= SHIELD_REGEN_DELAY then
+			local s = ship:GetAttribute("CurrentShields") or 0
+			local maxS = ship:GetAttribute("MaxShields") or MAX_SHIELDS
+			if s < maxS then
+				ship:SetAttribute("CurrentShields", math.min(maxS, s + SHIELD_REGEN_RATE * 0.25))
+			end
+		end
+	end
+end)
+
+-- ============================================================================
 -- SHOOTING
 -- ============================================================================
-local LASER_SPEED    = 750
-local LASER_LIFETIME = 5
-local lastShot       = 0
+local LASER_SPEED         = 750
+local LASER_LIFETIME      = 5
+local lastShot            = 0
 local BULLETS_FOLDER_NAME = "ShipBullets"
-
--- Mettilo a false una volta sistemato lo sparo. Quando true stampa ogni step
--- di spawnLaser per individuare dove muore.
-local LASER_DEBUG    = true
--- Quando true, il bullet NON viene distrutto da Touched: utile per vedere se
--- arriva almeno a comparire. Stampa pero' cosa lo avrebbe colpito.
-local LASER_NO_DESTROY = true
-local function ldbg(...)
-	if LASER_DEBUG then print("[ShipScript][" .. ship.Name .. "][LASER]", ...) end
-end
 
 local function getBulletsFolder()
 	local f = Workspace:FindFirstChild(BULLETS_FOLDER_NAME)
@@ -486,55 +523,29 @@ local function getBulletsFolder()
 	return f
 end
 
--- Debug: stampa una sola volta lo stato del template a runtime cosi' vediamo
--- se la nave trova LaserBolt e da dove.
-local debugAnnounced = false
-local function announceTemplateOnce()
-	if debugAnnounced then return end
-	debugAnnounced = true
-	if laserTemplate then
-		print(("[ShipScript][%s] LaserBolt template trovato: %s")
-			:format(ship.Name, laserTemplate:GetFullName()))
-	else
-		warn(("[ShipScript][%s] LaserBolt template NON trovato (cerco FlightEvents.%s.LaserBolt).")
-			:format(ship.Name, ship.Name))
+-- Risale dalla part colpita al Model "nave" (cerca un VehicleSeat tra i
+-- discendenti). Se trovato e diverso da noi, applichiamo danno alla nave.
+local function findShipModelFrom(hitInstance)
+	local m = hitInstance:FindFirstAncestorOfClass("Model")
+	while m do
+		if m:FindFirstChildWhichIsA("VehicleSeat", true) then return m end
+		m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model") or nil
 	end
+	return nil
 end
 
--- Il template del proiettile sta in ReplicatedStorage.FlightEvents.LaserBolt.
--- Lo cloniamo, lo orientiamo verso la direzione di tiro, gli appiccichiamo
--- una LinearVelocity e gestiamo collisione/danno.
-local function spawnLaserInternal(originPos, direction)
-	ldbg("spawnLaser ENTER  origin=", originPos, " dir=", direction)
-
-	-- Lazy-resolve nel caso il template sia stato aggiunto dopo l'avvio.
+local function spawnLaser(originPos, direction)
+	-- Lazy-resolve template se aggiunto dopo l'avvio
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
 		laserTemplate = resolveLaserTemplate()
 	end
-	announceTemplateOnce()
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
-		warn(("[ShipScript] %s: LaserBolt non trovato (cerco FlightEvents.%s.LaserBolt)."):format(ship.Name, ship.Name))
+		warn(("[ShipScript] %s: LaserBolt non trovato (FlightEvents.%s.LaserBolt)."):format(ship.Name, ship.Name))
 		return
 	end
+	if direction.Magnitude < 1e-3 or direction.X ~= direction.X then return end
 
-	-- Sanity check direction: se e' (0,0,0) o NaN, lookAt esploderebbe
-	if direction.Magnitude < 1e-3 or direction.X ~= direction.X then
-		warn("[ShipScript] direction invalida:", direction)
-		return
-	end
-
-	ldbg("cloning template...")
 	local laser = laserTemplate:Clone()
-	ldbg("clone ok:", laser.ClassName, " transparency=", laser.Transparency, " size=", laser.Size)
-
-	-- IMPORTANTE: NON tocco ne' Transparency ne' Size del clone -- vengono dal
-	-- template e l'utente vuole che restino come sono.
-	--
-	-- Movimento: NIENTE LinearVelocity. Con MaxForce=huge + Massless=true il
-	-- solver applicava forze/torque infiniti sugli Attachment offset, e il
-	-- bullet veniva sparato a 10^9 studs in un frame (fuori dai bounds di
-	-- Roblox -> auto-destroy). Usiamo invece Anchored + CFrame loop a mano
-	-- + raycast per la hit detection: prevedibile, niente sorprese fisiche.
 	laser.Name       = "ShipLaser"
 	laser.Anchored   = true
 	laser.CanCollide = false
@@ -542,9 +553,7 @@ local function spawnLaserInternal(originPos, direction)
 	laser.CanTouch   = false
 	laser.CFrame     = CFrame.lookAt(originPos, originPos + direction)
 	laser.Parent     = getBulletsFolder()
-	ldbg("PARENTED in", laser.Parent and laser.Parent:GetFullName() or "<nil>")
 
-	-- Loop di movimento + raycast forward per hit detection.
 	task.spawn(function()
 		local rayParams = RaycastParams.new()
 		rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -560,17 +569,32 @@ local function spawnLaserInternal(originPos, direction)
 			lastTime  = now
 
 			local step = direction * LASER_SPEED * dt
-			-- Raycast dal punto attuale di step studs in avanti.
-			local hit = workspace:Raycast(laser.Position, step, rayParams)
+			local hit  = workspace:Raycast(laser.Position, step, rayParams)
 			if hit then
-				-- Sposta il bullet sul punto d'impatto.
 				laser.CFrame = CFrame.lookAt(hit.Position, hit.Position + direction)
-				local model = hit.Instance:FindFirstAncestorOfClass("Model")
-				local hum   = model and model:FindFirstChildOfClass("Humanoid")
-				if hum and hum.Health > 0 then
-					hum:TakeDamage(CONFIG.Damage)
+				-- 1) Nave colpita: danno a scudi -> scafo via Attributes.
+				-- Il suo ShipScript ascolta CurrentHealth/Shields e replica all'HUD.
+				local hitShip = findShipModelFrom(hit.Instance)
+				if hitShip and hitShip ~= ship then
+					local s    = hitShip:GetAttribute("CurrentShields") or 0
+					local h    = hitShip:GetAttribute("CurrentHealth")  or 0
+					local left = CONFIG.Damage
+					if s > 0 then
+						local absorbed = math.min(s, left)
+						hitShip:SetAttribute("CurrentShields", s - absorbed)
+						left = left - absorbed
+					end
+					if left > 0 then
+						hitShip:SetAttribute("CurrentHealth", math.max(0, h - left))
+					end
+				else
+					-- 2) Player a piedi (Humanoid)
+					local model = hit.Instance:FindFirstAncestorOfClass("Model")
+					local hum   = model and model:FindFirstChildOfClass("Humanoid")
+					if hum and hum.Health > 0 then
+						hum:TakeDamage(CONFIG.Damage)
+					end
 				end
-				ldbg("HIT", hit.Instance:GetFullName())
 				break
 			end
 
@@ -580,19 +604,6 @@ local function spawnLaserInternal(originPos, direction)
 
 		if laser.Parent then laser:Destroy() end
 	end)
-end
-
--- Wrapper: cattura QUALSIASI errore in spawnLaserInternal e lo stampa con
--- traceback completo, cosi' anche se qualcosa nel template (vincolo strano,
--- script figlio che fallisce sul clone, ecc.) tira giu' la chiamata,
--- vediamo cos'e' successo.
-local function spawnLaser(originPos, direction)
-	local ok, err = xpcall(function()
-		spawnLaserInternal(originPos, direction)
-	end, debug.traceback)
-	if not ok then
-		warn("[ShipScript][" .. ship.Name .. "] spawnLaser ERROR:\n" .. tostring(err))
-	end
 end
 
 ShipEvent.OnServerEvent:Connect(function(player, action, data)
