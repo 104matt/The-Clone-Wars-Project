@@ -113,114 +113,67 @@ local function buildHud()
 		Rotation = 90,
 	})
 
-	-- ---- Reticle (center) -------------------------------------------------
+	-- ---- Mobile crosshair (mira) -----------------------------------------
+	-- Piccolo crosshair che segue il punto di mira (mouse o muso). Indica sia
+	-- dove andra' a sparare, sia dove la nave virera'. Niente piu' mega-ring
+	-- statico al centro.
 	local reticle = new("Frame", {
 		Name                   = "Reticle",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(180, 180),
+		Size                   = UDim2.fromOffset(28, 28),
 		BackgroundTransparency = 1,
 		Parent                 = gui,
 	})
 
-	-- Outer rotating ring
+	-- Anello esterno sottile
 	local outerRing = new("Frame", {
-		Name                   = "OuterRing",
+		Name                   = "Ring",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
 		Size                   = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
 		Parent                 = reticle,
 	})
-	stroke(outerRing, PALETTE.primary, 1.2, 0.25)
+	stroke(outerRing, PALETTE.primary, 1.2, 0.15)
 	corner(outerRing, 999)
-	new("UIGradient", {
-		Parent       = outerRing:FindFirstChildOfClass("UIStroke"),
-		Color        = ColorSequence.new(PALETTE.primary),
-		Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0,    0.1),
-			NumberSequenceKeypoint.new(0.25, 1),
-			NumberSequenceKeypoint.new(0.5,  0.1),
-			NumberSequenceKeypoint.new(0.75, 1),
-			NumberSequenceKeypoint.new(1,    0.1),
-		}),
-	})
 
-	-- Inner solid ring (target indicator)
-	local innerRing = new("Frame", {
-		Name                   = "InnerRing",
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(54, 54),
-		BackgroundTransparency = 1,
-		Parent                 = reticle,
-	})
-	stroke(innerRing, PALETTE.primary, 1.5, 0.1)
-	corner(innerRing, 999)
-
-	-- Center dot
+	-- Dot centrale
 	local dot = new("Frame", {
 		Name                   = "Dot",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(3, 3),
-		BackgroundColor3       = PALETTE.text,
+		Size                   = UDim2.fromOffset(2, 2),
+		BackgroundColor3       = PALETTE.primary,
 		BorderSizePixel        = 0,
 		Parent                 = reticle,
 	})
 	corner(dot, 999)
 
-	-- Tick marks (N/E/S/W)
+	-- 4 trattini cardinali (T/D/L/R) intorno al ring per dare profondita'
 	for i, rot in ipairs({0, 90, 180, 270}) do
-		local tick = new("Frame", {
-			Name                   = "Tick" .. i,
+		local tickC = new("Frame", {
 			AnchorPoint            = Vector2.new(0.5, 0.5),
 			Position               = UDim2.fromScale(0.5, 0.5),
-			Size                   = UDim2.fromOffset(2, 96),
+			Size                   = UDim2.fromOffset(2, 22),
 			BackgroundTransparency = 1,
 			Rotation               = rot,
 			Parent                 = reticle,
 		})
 		new("Frame", {
 			AnchorPoint            = Vector2.new(0.5, 0),
-			Position               = UDim2.new(0.5, 0, 0, 0),
-			Size                   = UDim2.fromOffset(2, 14),
+			Position               = UDim2.fromScale(0.5, 0),
+			Size                   = UDim2.fromOffset(2, 4),
 			BackgroundColor3       = PALETTE.primary,
 			BorderSizePixel        = 0,
-			Parent                 = tick,
-		})
-		new("Frame", {
-			AnchorPoint            = Vector2.new(0.5, 1),
-			Position               = UDim2.new(0.5, 0, 1, 0),
-			Size                   = UDim2.fromOffset(2, 14),
-			BackgroundColor3       = PALETTE.primary,
-			BorderSizePixel        = 0,
-			Parent                 = tick,
+			Parent                 = tickC,
 		})
 	end
 
-	-- Reload arc (under the reticle, fills clockwise via UIGradient offset)
-	local reloadFrame = new("Frame", {
-		Name                   = "ReloadFrame",
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(212, 212),
-		BackgroundTransparency = 1,
-		Parent                 = reticle,
-	})
-	local reloadStroke = stroke(reloadFrame, PALETTE.accent, 2, 0)
-	corner(reloadFrame, 999)
-	local reloadGradient = new("UIGradient", {
-		Parent       = reloadStroke,
-		Color        = ColorSequence.new(PALETTE.accent),
-		Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0,    0),
-			NumberSequenceKeypoint.new(0.001, 0),
-			NumberSequenceKeypoint.new(0.002, 1),
-			NumberSequenceKeypoint.new(1,    1),
-		}),
-		Rotation = -90,
-	})
+	-- alias per compatibilita' col vecchio codice che chiama InnerRing
+	local innerRing      = outerRing
+	-- (rimosso il reload arc; lo stato di reload e' indicato col tint del reticle)
+	local reloadGradient = Instance.new("UIGradient")  -- noop, evita nil-refs
 
 	-- ---- TOP-LEFT: Ship info card ----------------------------------------
 	local infoCard = new("Frame", {
@@ -630,7 +583,7 @@ local function buildHud()
 	controlRow(1,  "R",     "Engine")
 	controlRow(2,  "W S",   "Accel/Brake")
 	controlRow(3,  "A D",   "Roll")
-	controlRow(4,  "Q E",   "Down/Up")
+	controlRow(4,  "Q E",   "Down/Up (Cruise)")
 	local qeRow = nil  -- riga Q/E ora sempre visibile (vale anche in flight)
 	controlRow(5,  "SHIFT", "Boost")
 	controlRow(6,  "V",     "Free Cam")
@@ -870,9 +823,10 @@ local function tween(obj, t, props, style, dir)
 end
 
 local function pulseRingOnFire()
-	tween(HUD.InnerRing, 0.08, { Size = UDim2.fromOffset(38, 38) })
-	task.delay(0.09, function()
-		tween(HUD.InnerRing, 0.18, { Size = UDim2.fromOffset(54, 54) })
+	-- Piccolo bump del reticolo mobile a ogni colpo
+	tween(HUD.Reticle, 0.05, { Size = UDim2.fromOffset(36, 36) })
+	task.delay(0.06, function()
+		tween(HUD.Reticle, 0.16, { Size = UDim2.fromOffset(28, 28) })
 	end)
 end
 
@@ -1027,21 +981,28 @@ local function axis(pos, neg)
 end
 
 local function readMoveInput()
+	-- Q/E (su/giu') sono disponibili SOLO in cruise. In full throttle (sfoils
+	-- aperte) la nave non vira verticalmente con Q/E: deve usare il mouse.
+	-- Hover mantiene Q/E per il decollo/atterraggio.
+	local vertical = 0
+	if state.mode == "hover" or not state.sfoils then
+		vertical = axis(Enum.KeyCode.E, Enum.KeyCode.Q)
+	end
 	return
 		axis(Enum.KeyCode.W, Enum.KeyCode.S),  -- throttle  (W=+1, S=-1)
-		axis(Enum.KeyCode.D, Enum.KeyCode.A),  -- right   (D=+1, A=-1)
-		axis(Enum.KeyCode.E, Enum.KeyCode.Q)   -- up      (E=+1, Q=-1)
+		axis(Enum.KeyCode.D, Enum.KeyCode.A),  -- right     (D=+1, A=-1)
+		vertical                                -- up        (E=+1, Q=-1) solo in cruise/hover
 end
 
 -- ----------------------------------------------------------------------------
 local function setMouseLocked(locked)
 	if locked then
-		UserInputService.MouseBehavior  = Enum.MouseBehavior.LockCenter
-		UserInputService.MouseIconEnabled = false
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 	else
-		UserInputService.MouseBehavior  = Enum.MouseBehavior.Default
-		UserInputService.MouseIconEnabled = true
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 	end
+	-- Il cursore OS resta sempre nascosto durante il volo: il reticolo mobile
+	-- e' la mira (gestito su startFlight/stopFlight).
 end
 
 local function setMode(newMode)
@@ -1120,8 +1081,12 @@ local function startFlight(ship, seat)
 			tween(card, 0.4, { Position = target, BackgroundTransparency = 0.25 })
 		end
 	end
-	HUD.Reticle.Size = UDim2.fromOffset(120, 120)
-	tween(HUD.Reticle, 0.45, { Size = UDim2.fromOffset(180, 180) }, Enum.EasingStyle.Back)
+	-- Nascondi il cursore OS: la mira e' il reticolo mobile.
+	UserInputService.MouseIconEnabled = false
+
+	-- Piccola "reveal" del reticolo mobile
+	HUD.Reticle.Size = UDim2.fromOffset(20, 20)
+	tween(HUD.Reticle, 0.35, { Size = UDim2.fromOffset(28, 28) }, Enum.EasingStyle.Back)
 
 	-- Mode iniziale: hover se supportata, altrimenti volo diretto
 	state.mode = nil
@@ -1134,6 +1099,7 @@ local function stopFlight()
 	camera.FieldOfView  = BASE_FOV  -- ripristina FOV (potrebbe essere alterato da cockpit/boost)
 	mouse.TargetFilter  = nil
 	setMouseLocked(false)
+	UserInputService.MouseIconEnabled = true
 	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
 	if hum then hum.CameraOffset = Vector3.zero end
 	state.boostActive = false
@@ -1279,7 +1245,6 @@ end
 -- RENDER LOOP
 -- ============================================================================
 
-local outerSpin       = 0
 local replicateAccum  = 0
 
 -- Smooth-lerp helper resistente al framerate
@@ -1288,20 +1253,14 @@ local function damp(current, target, lambda, dt)
 end
 
 RunService.RenderStepped:Connect(function(dt)
-	-- Animazione costante: outer ring spin
-	outerSpin = (outerSpin + dt * 36) % 360
-	HUD.OuterRing.Rotation = outerSpin
-
-	-- Reload arc progress
+	-- Reticle reload feedback: durante il reload tinta scura, a ready brillante.
 	if state.ship then
 		local since = os.clock() - state.lastShot
 		local pct   = math.clamp(since / math.max(state.config.ReloadSpeed, 0.01), 0, 1)
-		HUD.ReloadGradient.Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0,                       0),
-			NumberSequenceKeypoint.new(math.max(pct, 0.001),    0),
-			NumberSequenceKeypoint.new(math.min(pct + 0.001, 1), 1),
-			NumberSequenceKeypoint.new(1,                       1),
-		})
+		local ringStroke = HUD.OuterRing:FindFirstChildOfClass("UIStroke")
+		if ringStroke then
+			ringStroke.Transparency = 0.7 - pct * 0.55  -- 0.7 -> 0.15
+		end
 	end
 
 	-- Detect seat changes
@@ -1593,8 +1552,30 @@ RunService.RenderStepped:Connect(function(dt)
 		HUD.BoostFill.BackgroundColor3 = PALETTE.primary
 	end
 
-	-- Reticle: in hover non aiming col cursore, smorziamo il reticolo
-	HUD.Reticle.Visible = (state.mode == "flight")
+	-- Reticle MOBILE: indica dove sparerai (= dove la nave virera').
+	--   - chase normale  -> posizione del cursore
+	--   - free cam       -> proiezione del muso (centro schermo)
+	--   - hover          -> nascosto (non si spara in hover)
+	--   - lock-on attivo -> nascosto, LeadReticle prende il suo posto
+	if state.mode ~= "flight" or (state.leadPoint and state.lockedHrp and state.lockedHrp.Parent) then
+		HUD.Reticle.Visible = false
+	else
+		HUD.Reticle.Visible = true
+		if state.camView == "free" then
+			-- muso proiettato a ~1000 studs davanti
+			local muso = state.primary.Position + (-state.primary.CFrame.LookVector) * 1000
+			local sx, sy, on = worldToScreen(muso)
+			if on then
+				HUD.Reticle.Position = UDim2.fromOffset(sx, sy)
+			else
+				HUD.Reticle.Position = UDim2.fromScale(0.5, 0.5)
+			end
+		else
+			-- chase: segui il cursore (GetMouseLocation ignora il GuiInset, OK con IgnoreGuiInset)
+			local m = UserInputService:GetMouseLocation()
+			HUD.Reticle.Position = UDim2.fromOffset(m.X, m.Y)
+		end
+	end
 
 	-- ============ VITALS (shields/hp) =====================================
 	local maxS = state.ship:GetAttribute("MaxShields")    or 100
