@@ -46,6 +46,7 @@ local CONFIG = {
 	FireSound   = attr("FireSound", ""),
 	ReloadSpeed = attr("ReloadSpeed", 0.18),
 	CanHover    = attr("CanHover", false),
+	Faction     = attr("Faction", "Republic"),  -- evita fuoco amico sui laser
 }
 
 -- Aggiorna live se uno modifica gli attributi in Studio
@@ -53,6 +54,7 @@ ship:GetAttributeChangedSignal("Damage"):Connect(function()      CONFIG.Damage  
 ship:GetAttributeChangedSignal("MaxSpeed"):Connect(function()    CONFIG.MaxSpeed    = attr("MaxSpeed", 150)    end)
 ship:GetAttributeChangedSignal("ReloadSpeed"):Connect(function() CONFIG.ReloadSpeed = attr("ReloadSpeed", 0.18) end)
 ship:GetAttributeChangedSignal("CanHover"):Connect(function()    CONFIG.CanHover    = attr("CanHover", false)  end)
+ship:GetAttributeChangedSignal("Faction"):Connect(function()     CONFIG.Faction     = attr("Faction", "Republic") end)
 ship:GetAttributeChangedSignal("FireSound"):Connect(function()
 	CONFIG.FireSound = attr("FireSound", "")
 	if fireSound then fireSound.SoundId = CONFIG.FireSound end
@@ -153,11 +155,43 @@ local function setGroupTransparency(group, t)
 	end
 end
 
+-- Trail/particelle di PUNTA D'ALA: accese SOLO in combat (ali aperte).
+-- Sono opzionali: cerchiamo nel modello ogni Trail/ParticleEmitter/Beam che sta
+-- dentro una part il cui nome contiene "WingTip" o "WingTrail", oppure che si
+-- chiama "WingTrail*". Se non ne trovi, la funzione e' un no-op silenzioso.
+local function isWingtipEmitter(obj)
+	if not (obj:IsA("Trail") or obj:IsA("ParticleEmitter") or obj:IsA("Beam")) then
+		return false
+	end
+	if obj.Name:match("^WingTrail") or obj.Name:match("^WingTip") then
+		return true
+	end
+	local p = obj:FindFirstAncestorWhichIsA("BasePart")
+	if p then
+		local n = p.Name
+		if n:match("WingTip") or n:match("WingTrail") then return true end
+	end
+	return false
+end
+
+local wingtipEmitters = {}
+for _, d in ipairs(ship:GetDescendants()) do
+	if isWingtipEmitter(d) then table.insert(wingtipEmitters, d) end
+end
+
+local function setWingtipTrails(on)
+	for _, e in ipairs(wingtipEmitters) do
+		e.Enabled = on
+	end
+end
+
 local function updateWings(open)
 	setGroupTransparency(leftWing,  open and 1 or 0)
 	setGroupTransparency(rightWing, open and 1 or 0)
 	setGroupTransparency(openLeft,  open and 0 or 1)
 	setGroupTransparency(openRight, open and 0 or 1)
+	-- Combat (ali aperte) => trail di punta accesi; Hangar => spenti.
+	setWingtipTrails(open)
 end
 updateWings(false)
 
@@ -394,6 +428,8 @@ local function spawnLaser(originPos, direction)
 	conn = laser.Touched:Connect(function(other)
 		if other:IsDescendantOf(ship) then return end
 		local model = other:FindFirstAncestorOfClass("Model")
+		-- Niente fuoco amico: salta i bersagli della stessa fazione della nave.
+		if model and model:GetAttribute("Faction") == CONFIG.Faction then return end
 		local hum   = model and model:FindFirstChildOfClass("Humanoid")
 		if hum and hum.Health > 0 then
 			hum:TakeDamage(CONFIG.Damage)
@@ -412,17 +448,37 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 	if pilotChar ~= player.Character then return end -- non sta pilotando questa nave
 
 	if action == "Shoot" then
-		if typeof(data.Direction) ~= "Vector3" then return end
 		local now = os.clock()
 		if now - lastShot < CONFIG.ReloadSpeed then return end
+
+		-- CONVERGENZA: il client invia un punto-mondo (Converge) dove le canne
+		-- d'ala devono incrociare il fuoco. Ogni canna spara verso quel punto,
+		-- quindi i raggi NON sono paralleli ma puntano "verso dentro".
+		-- Fallback: vecchio comportamento con Direction parallela.
+		local converge = (typeof(data.Converge) == "Vector3") and data.Converge or nil
+		local dir      = (typeof(data.Direction) == "Vector3") and data.Direction.Unit or nil
+		if not converge and not dir then return end
 		lastShot = now
 
-		local dir = data.Direction.Unit
+		local function dirFrom(originPart)
+			if converge then
+				local d = converge - originPart.Position
+				if d.Magnitude > 0.001 then return d.Unit end
+			end
+			return dir or (-primary.CFrame.LookVector)
+		end
+
 		local fired = false
-		if laser1 then spawnLaser(laser1.Position, dir); fired = true end
-		if laser2 then spawnLaser(laser2.Position, dir); fired = true end
+		if laser1 then spawnLaser(laser1.Position, dirFrom(laser1)); fired = true end
+		if laser2 then spawnLaser(laser2.Position, dirFrom(laser2)); fired = true end
 		if not fired then
-			spawnLaser(primary.Position + primary.CFrame.LookVector * 8, dir)
+			local muzzle = primary.Position + primary.CFrame.LookVector * 8
+			local d = dir
+			if converge then
+				local v = converge - muzzle
+				if v.Magnitude > 0.001 then d = v.Unit end
+			end
+			spawnLaser(muzzle, d or (-primary.CFrame.LookVector))
 		end
 		if fireSound and fireSound.SoundId ~= "" then
 			fireSound:Play()
