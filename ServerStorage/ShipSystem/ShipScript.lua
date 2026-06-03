@@ -775,7 +775,7 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 			if typeof(data.Direction) == "Vector3" then
 				return data.Direction.Unit
 			end
-			return -primary.CFrame.LookVector
+			return primary.CFrame.LookVector
 		end
 
 		if #cannons > 0 then

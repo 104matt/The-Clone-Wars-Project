@@ -1011,7 +1011,7 @@ local function setMode(newMode)
 		state.aimPitch = 0
 		state.bank     = 0
 		if state.primary then
-			state.flightVel = -state.primary.CFrame.LookVector * state.currentSpeed
+			state.flightVel = state.primary.CFrame.LookVector * state.currentSpeed
 			state.aimCFrame = state.primary.CFrame
 		end
 		HUD.Crosshair.Visible = true
@@ -1204,13 +1204,12 @@ RunService.RenderStepped:Connect(function(dt)
 			state.currentSpeed = math.max(state.currentSpeed - HANGAR_ACCEL * 0.4 * dt, 0)
 		end
 
-		state.hangarYaw = state.hangarYaw - rgtInput * HANGAR_TURN_RATE * dt
+		state.hangarYaw = state.hangarYaw + rgtInput * HANGAR_TURN_RATE * dt
 
-		-- Modello rovesciato: muso = -LookVector. hangarYaw=0 → muso verso -Z
-		local noseDirFlat = Vector3.new(-math.sin(state.hangarYaw), 0, -math.cos(state.hangarYaw))
-		-- CFrame.lookAt(zero, -noseDir) mette LookVector = -noseDir (rovesciato ok)
+		-- muso = +LookVector. hangarYaw=0 → muso verso +Z
+		local noseDirFlat = Vector3.new(math.sin(state.hangarYaw), 0, math.cos(state.hangarYaw))
 		if state.gyro then
-			state.gyro.CFrame = CFrame.lookAt(Vector3.zero, -noseDirFlat)
+			state.gyro.CFrame = CFrame.lookAt(Vector3.zero, noseDirFlat)
 		end
 		if state.velocity then
 			state.velocity.Velocity = noseDirFlat * state.currentSpeed
@@ -1255,10 +1254,10 @@ RunService.RenderStepped:Connect(function(dt)
 		local sy = math.sin(state.aimYaw)
 		local cp = math.cos(state.aimPitch)
 		local sp = math.sin(state.aimPitch)
-		local noseDir = Vector3.new(-sy * cp, sp, -cy * cp)
+		local noseDir = Vector3.new(sy * cp, sp, cy * cp)
 
-		-- Gyro: CFrame rovesciato + bank
-		local baseCF    = CFrame.lookAt(Vector3.zero, -noseDir)
+		-- Gyro: muso = +LookVector + bank
+		local baseCF    = CFrame.lookAt(Vector3.zero, noseDir)
 		local targetCF  = baseCF * CFrame.Angles(0, 0, state.bank)
 		local desiredCF = CFrame.new(state.primary.Position) * (targetCF - targetCF.Position)
 
@@ -1293,7 +1292,7 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 
 		-- Muso reale nel mondo (modello rovesciato: muso = -LookVector)
-		local noseWorld = -state.primary.CFrame.LookVector
+		local noseWorld = state.primary.CFrame.LookVector
 
 		local newTarget = pickTarget(state.candidates, noseWorld, state.primary.Position)
 		state.target = newTarget
@@ -1429,7 +1428,7 @@ local function tryShoot()
 	state.lastShot = now
 
 	-- Punto di convergenza: lungo il muso, alla distanza del bersaglio
-	local noseWorld = -state.primary.CFrame.LookVector
+	local noseWorld = state.primary.CFrame.LookVector
 	local convDist  = DEFAULT_CONV_DIST
 
 	if state.target then
