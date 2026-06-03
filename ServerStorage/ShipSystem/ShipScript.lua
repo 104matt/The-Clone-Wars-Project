@@ -22,8 +22,24 @@ local Workspace         = game:GetService("Workspace")
 local Debris            = game:GetService("Debris")
 
 local ship          = script.Parent
-local FlightEvents  = ReplicatedStorage:WaitForChild("FlightEvents")
-local ShipEvent     = FlightEvents:WaitForChild("ShipEvent")
+
+-- FlightEvents/ShipEvent: NON aspettiamo all'infinito ShipBootstrap. Se la
+-- cartella o il RemoteEvent mancano, li creiamo qui. Cosi' la nave si inizializza
+-- (e si salda) anche senza ShipBootstrap nel posto, e il client li riceve via
+-- replica appena esistono.
+local function ensureChild(parent, name, className)
+	local c = parent:FindFirstChild(name)
+	if not c or not c:IsA(className) then
+		if c then c:Destroy() end
+		c = Instance.new(className)
+		c.Name   = name
+		c.Parent = parent
+	end
+	return c
+end
+
+local FlightEvents  = ensureChild(ReplicatedStorage, "FlightEvents", "Folder")
+local ShipEvent     = ensureChild(FlightEvents, "ShipEvent", "RemoteEvent")
 -- LaserBolt e' un Part configurato in Studio dall'utente. WaitForChild con
 -- timeout: se manca, lasciamo che spawnLaser stampi un warn invece di
 -- bloccare l'intera inizializzazione della nave.
