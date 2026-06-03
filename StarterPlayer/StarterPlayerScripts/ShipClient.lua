@@ -530,7 +530,7 @@ local function buildHud()
 	controlRow(4,  "Q E",   "Down/Up")
 	local qeRow = nil  -- riga Q/E ora sempre visibile (vale anche in flight)
 	controlRow(5,  "SHIFT", "Boost")
-	controlRow(6,  "V",     "Cockpit View")
+	controlRow(6,  "V",     "Free Cam")
 	controlRow(7,  "N",     "Toggle Mode")
 	controlRow(8,  "LMB",   "Fire")
 	controlRow(9,  "RMB",   "Zoom Aim")
@@ -818,10 +818,14 @@ local RECOIL_DECAY        = 11     -- lambda damping del recoil verso zero
 local RECOIL_MAX_BACK     = 2.5    -- cap del kick accumulato
 local RECOIL_MAX_PITCH    = 0.09
 
--- Cockpit camera (V per toggle chase <-> cockpit)
-local COCKPIT_FORWARD     = 1.5    -- offset avanti dalla CFrame della CockpitPart
-local COCKPIT_UP          = 0.5
-local COCKPIT_FOV         = 80     -- FOV in cockpit (piu' wide)
+-- Free cam (V per toggle chase <-> free orbit)
+-- In free cam la nave mantiene la rotta corrente (heading bloccato), il mouse
+-- ruota la camera attorno alla nave (yaw + pitch), il wheel regola la distanza.
+-- Per tornare a sterzare col mouse, ripremi V.
+local FREE_MIN_DIST       = 12
+local FREE_MAX_DIST       = 80
+local FREE_DEFAULT_DIST   = 28
+local FREE_MOUSE_SENS     = 0.005   -- rad / pixel
 
 local state = {
 	ship           = nil,
@@ -854,9 +858,11 @@ local state = {
 	-- zoom / aim
 	zoomMode       = false,
 
-	-- camera view (chase <-> cockpit) -- gestito con V
-	camView        = "chase",         -- "chase" | "cockpit"
-	cockpitPart    = nil,
+	-- camera view (chase <-> free orbit) -- gestito con V
+	camView        = "chase",         -- "chase" | "free"
+	freeYaw        = 0,
+	freePitch      = -0.15,
+	freeDistance   = FREE_DEFAULT_DIST,
 
 	-- camera recoil (decay per-frame)
 	recoilBack     = 0,
@@ -938,7 +944,6 @@ local function startFlight(ship, seat)
 	state.primary   = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart")
 	state.camPart    = ship:FindFirstChild("CameraPart",  true)
 	state.zoomPart   = ship:FindFirstChild("ZoomPart",    true)
-	state.cockpitPart = ship:FindFirstChild("CockpitPart", true)  -- opzionale: se manca, fallback su PrimaryPart
 	state.gyro      = state.primary and state.primary:WaitForChild("ShipGyro",     2)
 	state.velocity  = state.primary and state.primary:WaitForChild("ShipVelocity", 2)
 	state.sfoils    = false
@@ -951,12 +956,15 @@ local function startFlight(ship, seat)
 	state.lastShot  = -math.huge
 
 	-- reset vista/boost/recoil ad ogni entrata
-	state.camView     = "chase"
-	state.recoilBack  = 0
-	state.recoilPitch = 0
-	state.boost       = 1
-	state.boostActive = false
-	state.boostFactor = 1
+	state.camView      = "chase"
+	state.freeYaw      = 0
+	state.freePitch    = -0.15
+	state.freeDistance = FREE_DEFAULT_DIST
+	state.recoilBack   = 0
+	state.recoilPitch  = 0
+	state.boost        = 1
+	state.boostActive  = false
+	state.boostFactor  = 1
 
 	readShipConfig(ship)
 
@@ -1071,8 +1079,6 @@ RunService.RenderStepped:Connect(function(dt)
 		or 1
 	state.boostFactor = damp(state.boostFactor, targetBoostFactor, 8, dt)
 
-	local cockpitPart = state.cockpitPart
-
 	if state.zoomMode and zoomPart then
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = zoomPart.CFrame
@@ -1084,25 +1090,16 @@ RunService.RenderStepped:Connect(function(dt)
 		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
-	elseif state.camView == "cockpit" then
-		-- Cockpit view: dentro l'abitacolo, guarda fuori dal muso.
-		-- Convenzione di questo progetto: il muso e' sul -LookVector del
-		-- PrimaryPart, ovvero sul +Z locale. Per posizionarsi al muso
-		-- traslo di +COCKPIT_FORWARD lungo Z. Per guardare fuori, ruoto
-		-- 180 gradi attorno a Y cosi' il LookVector della camera coincide
-		-- con il -LookVector della nave (la direzione di marcia).
-		--
-		-- Se in Studio metti una CockpitPart gia' orientata correttamente,
-		-- la usiamo direttamente.
+	elseif state.camView == "free" then
+		-- Free cam: orbita liberamente attorno alla nave (yaw/pitch col mouse,
+		-- wheel per la distanza). La nave NON segue piu' il cursore in questa
+		-- modalita': mantiene l'ultimo heading (impostato sotto in PHYSICS).
+		local shipPos = state.primary.Position
+		local rot     = CFrame.Angles(0, state.freeYaw, 0) * CFrame.Angles(state.freePitch, 0, 0)
+		local offset  = rot * Vector3.new(0, 0, state.freeDistance)
+		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
 		camera.CameraType = Enum.CameraType.Scriptable
-		if cockpitPart then
-			camera.CFrame = cockpitPart.CFrame
-		else
-			local p = state.primary
-			camera.CFrame = p.CFrame
-				* CFrame.new(0, COCKPIT_UP, COCKPIT_FORWARD)
-				* CFrame.Angles(0, math.pi, 0)
-		end
+		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
 	else
 		-- Camera chase: la CameraPart E' la camera. Usiamo la sua CFrame
 		-- completa (posizione + orientazione). Il wheel-zoom scorre lungo
@@ -1130,10 +1127,9 @@ RunService.RenderStepped:Connect(function(dt)
 			* CFrame.Angles(state.recoilPitch, 0, 0)
 	end
 
-	-- FOV: cockpit piu' wide; boost allarga ulteriormente
-	local baseFov   = (state.camView == "cockpit") and COCKPIT_FOV or BASE_FOV
+	-- FOV: boost allarga il FOV. Free cam tiene il BASE_FOV.
 	local boostFov  = (state.boostFactor - 1) / math.max(BOOST_MULTIPLIER - 1, 0.001) * BOOST_FOV_BONUS
-	camera.FieldOfView = baseFov + boostFov
+	camera.FieldOfView = BASE_FOV + boostFov
 
 	mouse.TargetFilter = state.ship
 
@@ -1227,17 +1223,25 @@ RunService.RenderStepped:Connect(function(dt)
 			state.rollAngle = a - math.sign(a) * math.min(math.abs(a), dt * 4)
 		end
 
-		-- Aim verso il cursore (la camera e' la CameraPart della nave, quindi
-		-- mouse.UnitRay/mouse.Hit sono coerenti con cio' che si vede).
-		local targetPos = mouse.Hit.Position
-		if mouse.Target == nil then
-			targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
+		-- Aim verso il cursore in chase. In free cam invece l'heading e'
+		-- BLOCCATO: la nave mantiene la rotazione corrente cosi' il mouse
+		-- e' libero di orbitare la camera senza far virare la nave.
+		local targetCFrame
+		if state.camView == "free" then
+			-- Tieni l'heading attuale (con piccolo lerp che lo agganciera' al
+			-- gyro). Niente roll mentre ti guardi attorno.
+			targetCFrame = state.primary.CFrame
+		else
+			local targetPos = mouse.Hit.Position
+			if mouse.Target == nil then
+				targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
+			end
+			local aimDir     = (targetPos - state.primary.Position).Unit
+			-- Il muso del modello e' sul -LookVector del PrimaryPart, quindi
+			-- il LookVector deve puntare al CONTRARIO del cursore.
+			local baseCFrame = CFrame.lookAt(state.primary.Position, state.primary.Position - aimDir)
+			targetCFrame     = baseCFrame * CFrame.Angles(0, 0, state.rollAngle)
 		end
-		local aimDir       = (targetPos - state.primary.Position).Unit
-		-- Il muso del modello e' sul -LookVector del PrimaryPart, quindi
-		-- il LookVector deve puntare al CONTRARIO del cursore.
-		local baseCFrame   = CFrame.lookAt(state.primary.Position, state.primary.Position - aimDir)
-		local targetCFrame = baseCFrame * CFrame.Angles(0, 0, state.rollAngle)
 
 		-- Smoothing: il setpoint del gyro si avvicina al target con un lerp
 		-- frame-rate independent (lambda = "velocita' di inseguimento").
@@ -1312,8 +1316,8 @@ RunService.RenderStepped:Connect(function(dt)
 		newMode = "CRUISE"
 		HUD.ModeChip.BackgroundColor3 = PALETTE.primary
 	end
-	if state.mode == "flight" and state.camView == "cockpit" then
-		newMode = newMode .. " · COCKPIT"
+	if state.mode == "flight" and state.camView == "free" then
+		newMode = newMode .. " · FREE CAM"
 	end
 	if state.boostActive and state.boost > 0 then
 		newMode = newMode .. " · BOOST"
@@ -1348,11 +1352,18 @@ local function tryShoot()
 	if now - state.lastShot < state.config.ReloadSpeed then return end
 	state.lastShot = now
 
-	local targetPos = mouse.Hit.Position
-	if mouse.Target == nil then
-		targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
+	-- In free cam non si mira col mouse (e' bloccato a orbitare la camera):
+	-- i proiettili escono lungo il muso (-LookVector del PrimaryPart).
+	local dir
+	if state.camView == "free" then
+		dir = (-state.primary.CFrame.LookVector).Unit
+	else
+		local targetPos = mouse.Hit.Position
+		if mouse.Target == nil then
+			targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
+		end
+		dir = (targetPos - state.primary.Position).Unit
 	end
-	local dir = (targetPos - state.primary.Position).Unit
 	ShipEvent:FireServer("Shoot", { Direction = dir })
 	pulseRingOnFire()
 
@@ -1391,9 +1402,23 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		ShipEvent:FireServer("EngineToggle", { State = state.engineOn })
 
 	elseif input.KeyCode == Enum.KeyCode.V then
-		-- Toggle vista: chase <-> cockpit. Solo in flight (hover ha gia' free orbit).
+		-- Toggle vista: chase <-> free orbit. Solo in flight (hover ha gia' free orbit).
 		if not state.ship or state.mode ~= "flight" then return end
-		state.camView = (state.camView == "cockpit") and "chase" or "cockpit"
+		if state.camView == "free" then
+			state.camView = "chase"
+			setMouseLocked(false)
+		else
+			-- Inizializza yaw/pitch dall'orientamento attuale della nave cosi'
+			-- la camera non "salta" entrando in free cam. La nave ha il muso
+			-- sul -LookVector, quindi guardiamo nella direzione opposta.
+			if state.primary then
+				local look = -state.primary.CFrame.LookVector
+				state.freeYaw   = math.atan2(-look.X, -look.Z)
+				state.freePitch = -0.15
+			end
+			state.camView = "free"
+			setMouseLocked(true)
+		end
 
 	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
 		-- Hold Shift = boost (afterburner). Si attiva solo sopra la soglia minima
@@ -1437,18 +1462,29 @@ end)
 UserInputService.InputChanged:Connect(function(input, processed)
 	if not state.ship then return end
 
-	-- Mouse delta in hover -> orbital camera
-	if input.UserInputType == Enum.UserInputType.MouseMovement and state.mode == "hover" then
-		state.hoverYaw   = state.hoverYaw   - input.Delta.X * 0.005
-		state.hoverPitch = math.clamp(state.hoverPitch - input.Delta.Y * 0.005, -1.45, 1.45)
-		return
+	-- Mouse delta -> orbital camera in hover OR in free cam (entrambe usano
+	-- LockCenter quindi il delta arriva pulito).
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		if state.mode == "hover" then
+			state.hoverYaw   = state.hoverYaw   - input.Delta.X * 0.005
+			state.hoverPitch = math.clamp(state.hoverPitch - input.Delta.Y * 0.005, -1.45, 1.45)
+			return
+		elseif state.camView == "free" then
+			state.freeYaw   = state.freeYaw   - input.Delta.X * FREE_MOUSE_SENS
+			state.freePitch = math.clamp(state.freePitch - input.Delta.Y * FREE_MOUSE_SENS, -1.45, 1.45)
+			return
+		end
 	end
 
-	-- Mouse wheel: in hover regola la distanza orbitale, in flight la chase
+	-- Mouse wheel: hover -> orbit dist, free -> free dist, chase -> chase dist
 	if input.UserInputType == Enum.UserInputType.MouseWheel then
 		if state.mode == "hover" then
 			state.hoverDistance = math.clamp(
 				state.hoverDistance - input.Position.Z * 4, MIN_HOVER, MAX_HOVER
+			)
+		elseif state.camView == "free" then
+			state.freeDistance = math.clamp(
+				state.freeDistance - input.Position.Z * 4, FREE_MIN_DIST, FREE_MAX_DIST
 			)
 		else
 			state.chaseDistance = math.clamp(

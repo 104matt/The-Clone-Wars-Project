@@ -24,10 +24,37 @@ local Debris            = game:GetService("Debris")
 local ship          = script.Parent
 local FlightEvents  = ReplicatedStorage:WaitForChild("FlightEvents")
 local ShipEvent     = FlightEvents:WaitForChild("ShipEvent")
--- LaserBolt e' un Part configurato in Studio dall'utente. WaitForChild con
--- timeout: se manca, lasciamo che spawnLaser stampi un warn invece di
--- bloccare l'intera inizializzazione della nave.
-local laserTemplate = FlightEvents:WaitForChild("LaserBolt", 5)
+
+-- LaserBolt template lookup, PER-NAVE:
+--   FlightEvents.<NomeModelloNave>.LaserBolt   (preferito)
+--   FlightEvents.LaserBolt                     (fallback legacy / globale)
+-- "NomeModelloNave" e' una Folder o Model dentro FlightEvents con stesso
+-- nome del Model nave (es. "ARC-170"). Dentro deve esserci una BasePart
+-- chiamata "LaserBolt".
+local function resolveLaserTemplate()
+	local perShip = FlightEvents:FindFirstChild(ship.Name)
+	if perShip then
+		local lb = perShip:FindFirstChild("LaserBolt")
+		if lb and lb:IsA("BasePart") then return lb end
+	end
+	local globalLb = FlightEvents:FindFirstChild("LaserBolt")
+	if globalLb and globalLb:IsA("BasePart") then return globalLb end
+	return nil
+end
+
+local laserTemplate = resolveLaserTemplate()
+if not laserTemplate then
+	-- Riprova in modo asincrono: il template potrebbe arrivare dopo l'avvio.
+	task.spawn(function()
+		for _ = 1, 30 do
+			task.wait(0.5)
+			laserTemplate = resolveLaserTemplate()
+			if laserTemplate then return end
+		end
+		warn(("[ShipScript] %s: nessun LaserBolt trovato in FlightEvents.%s o FlightEvents.LaserBolt.")
+			:format(ship.Name, ship.Name))
+	end)
+end
 
 local fireSound -- forward declaration: assegnata in fondo allo script
 
@@ -234,6 +261,77 @@ for _, d in ipairs(ship:GetDescendants()) do
 end
 
 -- ============================================================================
+-- SFOIL TRAILS  (Part chiamate "TrailPart" nel modello)
+-- Si accendono quando si APRONO le S-foils (esci da cruise). In cruise restano
+-- spente. Tipico effetto X-wing / ARC-170 quando si va in full throttle.
+-- ============================================================================
+local sfoilTrails = {}
+
+local function buildSfoilTrail(part)
+	local sz  = part.Size
+	local at0 = part:FindFirstChild("SfoilTrailA0")
+	if not at0 then
+		at0 = Instance.new("Attachment")
+		at0.Name   = "SfoilTrailA0"
+		at0.Parent = part
+	end
+	at0.Position = Vector3.new(0,  sz.Y / 2 * 0.85, sz.Z / 2)
+
+	local at1 = part:FindFirstChild("SfoilTrailA1")
+	if not at1 then
+		at1 = Instance.new("Attachment")
+		at1.Name   = "SfoilTrailA1"
+		at1.Parent = part
+	end
+	at1.Position = Vector3.new(0, -sz.Y / 2 * 0.85, sz.Z / 2)
+
+	local trail = part:FindFirstChild("SfoilTrail")
+	if not trail or not trail:IsA("Trail") then
+		if trail then trail:Destroy() end
+		trail        = Instance.new("Trail")
+		trail.Name   = "SfoilTrail"
+		trail.Parent = part
+	end
+	trail.Attachment0 = at0
+	trail.Attachment1 = at1
+	-- Scia bianca con sfumatura cyan ai bordi (stile X-wing / ARC-170 nei film)
+	trail.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(180, 230, 255)),
+		ColorSequenceKeypoint.new(1,   Color3.fromRGB(70,  140, 230)),
+	})
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0,   0.1),
+		NumberSequenceKeypoint.new(0.7, 0.65),
+		NumberSequenceKeypoint.new(1,   1),
+	})
+	trail.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	trail.Lifetime       = 0.8
+	trail.MinLength      = 0
+	trail.MaxLength      = 0
+	trail.LightEmission  = 1
+	trail.LightInfluence = 0
+	trail.FaceCamera     = true
+	trail.Enabled        = false
+	return trail
+end
+
+for _, d in ipairs(ship:GetDescendants()) do
+	if d:IsA("BasePart") and d.Name == "TrailPart" then
+		table.insert(sfoilTrails, buildSfoilTrail(d))
+	end
+end
+
+local function setSfoilTrails(enabled)
+	for _, t in ipairs(sfoilTrails) do
+		t.Enabled = enabled
+	end
+end
+
+-- ============================================================================
 -- ENGINE STATE
 -- ============================================================================
 local engineOn = false
@@ -321,6 +419,7 @@ local function onExit()
 	setEngine(false)
 	pcall(function() primary:SetNetworkOwner(nil) end)
 	updateWings(false)
+	setSfoilTrails(false)
 	prompt.Enabled = true
 end
 
@@ -353,10 +452,10 @@ local lastShot       = 0
 local function spawnLaser(originPos, direction)
 	-- Lazy-resolve nel caso il template sia stato aggiunto dopo l'avvio.
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
-		laserTemplate = FlightEvents:FindFirstChild("LaserBolt")
+		laserTemplate = resolveLaserTemplate()
 	end
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
-		warn("[ShipScript] FlightEvents.LaserBolt mancante o non e' una BasePart.")
+		warn(("[ShipScript] %s: LaserBolt non trovato (cerco FlightEvents.%s.LaserBolt)."):format(ship.Name, ship.Name))
 		return
 	end
 
@@ -429,7 +528,10 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 		end
 
 	elseif action == "ToggleSfoils" then
-		updateWings(data.State == true)
+		local open = data.State == true
+		updateWings(open)
+		-- Sfoil trails accese solo a foils APERTE (= esci da cruise)
+		setSfoilTrails(open)
 
 	elseif action == "EngineToggle" then
 		setEngine(data.State == true)
