@@ -80,6 +80,25 @@ local FLIGHT_CHASE_UP   = 7
 local MIN_CHASE, MAX_CHASE = -10, 80
 local MIN_HOVER, MAX_HOVER = 12, 70
 
+-- Camera tuning (client-only feel)
+local CAMERA_FOLLOW_STIFFNESS      = 42
+local CAMERA_FOLLOW_DAMPING        = 14
+local CAMERA_LOOK_STIFFNESS        = 30
+local CAMERA_LOOK_DAMPING          = 12
+local CAMERA_UP_LAMBDA             = 10
+local CAMERA_ZOOM_BLEND_LAMBDA     = 16
+local CAMERA_LOOK_AHEAD_BASE       = 160
+local CAMERA_LOOK_AHEAD_SPEED_SCALE = 0.55
+local CAMERA_LOOK_AHEAD_VEL_SCALE  = 0.2
+local CAMERA_BANK_INFLUENCE        = 0.33
+local CAMERA_BANK_MAX              = math.rad(20)
+local CAMERA_BANK_MAX_RATE         = math.rad(260)
+local CAMERA_GYRO_FILTER_LAMBDA    = 7
+local CAMERA_MAX_ANGULAR_SPEED     = math.rad(170)
+local CAMERA_MIN_PITCH             = math.rad(-58)
+local CAMERA_MAX_PITCH             = math.rad(58)
+local CAMERA_DEFAULT_LOOK_DISTANCE = 240
+
 -- ============================================================================
 -- COLORS / VISUAL TOKENS
 -- ============================================================================
@@ -855,6 +874,18 @@ local state = {
 	-- Zoom / aim RMB
 	zoomMode = false,
 
+	camera = {
+		initialized  = false,
+		position     = Vector3.zero,
+		velocity     = Vector3.zero,
+		lookPoint    = Vector3.zero,
+		lookVelocity = Vector3.zero,
+		upVector     = Vector3.yAxis,
+		zoomAlpha    = 0,
+		bankFiltered = 0,
+		combatOffset = nil,
+	},
+
 	-- Shooting
 	shooting = false,
 	lastShot = -math.huge,
@@ -1055,6 +1086,15 @@ local function startFlight(ship, seat)
 	state.aligned         = false
 	state.candidateTimer  = 0
 	state.candidates      = {}
+	state.camera.initialized  = false
+	state.camera.position     = Vector3.zero
+	state.camera.velocity     = Vector3.zero
+	state.camera.lookPoint    = Vector3.zero
+	state.camera.lookVelocity = Vector3.zero
+	state.camera.upVector     = Vector3.yAxis
+	state.camera.zoomAlpha    = 0
+	state.camera.bankFiltered = 0
+	state.camera.combatOffset = nil
 
 	readShipConfig(ship)
 
@@ -1064,6 +1104,9 @@ local function startFlight(ship, seat)
 		state.hoverYaw   = math.atan2(-look.X, -look.Z)
 		state.hoverPitch = -0.15
 		state.hoverDistance = 28
+		if state.camPart then
+			state.camera.combatOffset = state.primary.CFrame:PointToObjectSpace(state.camPart.Position)
+		end
 	end
 
 	-- HUD reveal
@@ -1117,6 +1160,51 @@ local function stopFlight()
 	state.gyro     = nil
 	state.velocity = nil
 	state.target   = nil
+	state.camera.initialized  = false
+	state.camera.velocity     = Vector3.zero
+	state.camera.lookVelocity = Vector3.zero
+end
+
+local function smoothAlpha(lambda, dt)
+	return 1 - math.exp(-math.max(lambda, 0) * math.max(dt, 0))
+end
+
+local function springStep(curr, vel, target, stiffness, damping, dt)
+	local accel = (target - curr) * stiffness - vel * damping
+	vel = vel + accel * dt
+	curr = curr + vel * dt
+	return curr, vel
+end
+
+local function safeUnit(v, fallback)
+	local mag = v.Magnitude
+	if mag > 1e-5 then
+		return v / mag
+	end
+	return fallback
+end
+
+local function clampLookPitch(origin, target, minPitch, maxPitch)
+	local dir = safeUnit(target - origin, Vector3.zAxis)
+	local pitch = math.asin(math.clamp(dir.Y, -1, 1))
+	pitch = math.clamp(pitch, minPitch, maxPitch)
+	local yaw = math.atan2(dir.X, dir.Z)
+	local cp = math.cos(pitch)
+	local clampedDir = Vector3.new(math.sin(yaw) * cp, math.sin(pitch), math.cos(yaw) * cp)
+	local dist = math.max((target - origin).Magnitude, CAMERA_DEFAULT_LOOK_DISTANCE)
+	return origin + clampedDir * dist
+end
+
+local function limitDirectionChange(currentDir, targetDir, maxAngle)
+	local from = safeUnit(currentDir, Vector3.zAxis)
+	local to   = safeUnit(targetDir, from)
+	local dot  = math.clamp(from:Dot(to), -1, 1)
+	local angle = math.acos(dot)
+	if angle <= maxAngle or angle < 1e-4 then
+		return to
+	end
+	local t = math.clamp(maxAngle / angle, 0, 1)
+	return safeUnit(from:Lerp(to, t), to)
 end
 
 -- ============================================================================
@@ -1158,35 +1246,100 @@ RunService.RenderStepped:Connect(function(dt)
 	-- ========================================================================
 	local inHangar   = (state.mode == "hangar")
 	local inFreeLook = (state.mode == "combat" and state.freeLook)
-	local camPart    = state.camPart
 	local zoomPart   = state.zoomPart
+	local shipPos    = state.primary.Position
+	local profilePos, profileLook, profileUp
 
-	if state.zoomMode and zoomPart then
-		camera.CameraType = Enum.CameraType.Scriptable
-		camera.CFrame     = zoomPart.CFrame
-	elseif inHangar or inFreeLook then
-		-- Orbita libera
-		local shipPos = state.primary.Position
-		local rot     = CFrame.Angles(0, state.hoverYaw, 0) * CFrame.Angles(state.hoverPitch, 0, 0)
-		local offset  = rot * Vector3.new(0, 0, state.hoverDistance)
-		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
-		camera.CameraType = Enum.CameraType.Scriptable
-		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
+	if inHangar or inFreeLook then
+		-- Orbita libera (profilo free-look/hangar)
+		local pivot = shipPos + Vector3.new(0, 2, 0)
+		local rot   = CFrame.Angles(0, state.hoverYaw, 0) * CFrame.Angles(state.hoverPitch, 0, 0)
+		local offset = rot * Vector3.new(0, 0, state.hoverDistance)
+		profilePos = pivot + offset
+		profileLook = pivot
+		profileUp = Vector3.yAxis
 	else
-		-- Camera chase (CameraPart)
-		camera.CameraType = Enum.CameraType.Scriptable
-		if camPart then
-			camera.CFrame = camPart.CFrame * CFrame.new(0, 0, state.chaseDistance)
+		-- Combat chase indipendente da CameraPart.CFrame
+		local refCF = state.aimCFrame or state.primary.CFrame
+		local shipFwd = refCF.LookVector
+		local shipUp  = refCF.UpVector
+
+		if state.camera.combatOffset then
+			profilePos = state.primary.CFrame:PointToWorldSpace(
+				state.camera.combatOffset + Vector3.new(0, 0, state.chaseDistance)
+			)
 		else
-			local shipPos = state.primary.Position
-			local shipFwd = state.primary.CFrame.LookVector
-			local shipUp  = state.primary.CFrame.UpVector
-			local camPos  = shipPos
+			profilePos = shipPos
 				- shipFwd * (FLIGHT_CHASE_BACK + state.chaseDistance)
 				+ shipUp  * FLIGHT_CHASE_UP
-			camera.CFrame = CFrame.lookAt(camPos, shipPos + shipFwd * 200, shipUp)
 		end
+
+		local speedForLook = math.clamp(state.currentSpeed, 0, math.max(state.config.MaxSpeed, 1))
+		profileLook = shipPos
+			+ shipFwd * (CAMERA_LOOK_AHEAD_BASE + speedForLook * CAMERA_LOOK_AHEAD_SPEED_SCALE)
+			+ state.flightVel * CAMERA_LOOK_AHEAD_VEL_SCALE
+
+		local targetBank = math.clamp((state.roll + state.bank) * CAMERA_BANK_INFLUENCE, -CAMERA_BANK_MAX, CAMERA_BANK_MAX)
+		local maxBankStep = CAMERA_BANK_MAX_RATE * dt
+		local bankDelta = math.clamp(targetBank - state.camera.bankFiltered, -maxBankStep, maxBankStep)
+		state.camera.bankFiltered = state.camera.bankFiltered + bankDelta
+		state.camera.bankFiltered = state.camera.bankFiltered
+			+ (targetBank - state.camera.bankFiltered) * smoothAlpha(CAMERA_GYRO_FILTER_LAMBDA, dt)
+
+		local bankCF = CFrame.fromAxisAngle(shipFwd, state.camera.bankFiltered)
+		profileUp = safeUnit(bankCF:VectorToWorldSpace(shipUp), shipUp)
 	end
+
+	local zoomTarget = (state.zoomMode and zoomPart) and 1 or 0
+	state.camera.zoomAlpha = state.camera.zoomAlpha
+		+ (zoomTarget - state.camera.zoomAlpha) * smoothAlpha(CAMERA_ZOOM_BLEND_LAMBDA, dt)
+	if zoomPart and state.camera.zoomAlpha > 0.001 then
+		local zPos  = zoomPart.Position
+		local zLook = zPos + zoomPart.CFrame.LookVector * CAMERA_DEFAULT_LOOK_DISTANCE
+		local zUp   = zoomPart.CFrame.UpVector
+		profilePos  = profilePos:Lerp(zPos, state.camera.zoomAlpha)
+		profileLook = profileLook:Lerp(zLook, state.camera.zoomAlpha)
+		profileUp   = safeUnit(profileUp:Lerp(zUp, state.camera.zoomAlpha), zUp)
+	end
+
+	profileLook = clampLookPitch(profilePos, profileLook, CAMERA_MIN_PITCH, CAMERA_MAX_PITCH)
+
+	if not state.camera.initialized then
+		state.camera.initialized  = true
+		state.camera.position     = profilePos
+		state.camera.lookPoint    = profileLook
+		state.camera.upVector     = profileUp
+		state.camera.velocity     = Vector3.zero
+		state.camera.lookVelocity = Vector3.zero
+	end
+
+	local currentDir = state.camera.lookPoint - state.camera.position
+	local targetDir  = profileLook - profilePos
+	local maxAngle   = CAMERA_MAX_ANGULAR_SPEED * dt
+	local limitedDir = limitDirectionChange(currentDir, targetDir, maxAngle)
+	local lookDist   = math.max(targetDir.Magnitude, CAMERA_DEFAULT_LOOK_DISTANCE)
+	local limitedLook = profilePos + limitedDir * lookDist
+
+	state.camera.position, state.camera.velocity = springStep(
+		state.camera.position, state.camera.velocity, profilePos,
+		CAMERA_FOLLOW_STIFFNESS, CAMERA_FOLLOW_DAMPING, dt
+	)
+	state.camera.lookPoint, state.camera.lookVelocity = springStep(
+		state.camera.lookPoint, state.camera.lookVelocity, limitedLook,
+		CAMERA_LOOK_STIFFNESS, CAMERA_LOOK_DAMPING, dt
+	)
+	state.camera.upVector = safeUnit(
+		state.camera.upVector:Lerp(profileUp, smoothAlpha(CAMERA_UP_LAMBDA, dt)),
+		profileUp
+	)
+
+	local lookTarget = state.camera.lookPoint
+	if (lookTarget - state.camera.position).Magnitude < 1 then
+		lookTarget = state.camera.position + limitedDir * CAMERA_DEFAULT_LOOK_DISTANCE
+	end
+
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.CFrame = CFrame.lookAt(state.camera.position, lookTarget, state.camera.upVector)
 
 	mouse.TargetFilter = state.ship
 
