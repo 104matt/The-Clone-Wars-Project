@@ -4,6 +4,8 @@
 --
 -- Struttura attesa del Model nave:
 --   VehicleSeat                  unico modo per salire (ProximityPrompt)
+--   NoseAttachment               riferimento canonico del muso (consigliato)
+--   FrontOfShip                  fallback alternativo se manca NoseAttachment
 --   CameraPart                   anchor camera inseguimento
 --   ZoomPart                     anchor camera mira
 --   Laser1, Laser2, ...          canne dei cannoni (auto-detect)
@@ -200,6 +202,55 @@ if not primary then
 	error("[DBG] ERRORE FATALE: PrimaryPart impossibile da determinare in " .. ship:GetFullName())
 end
 print("[DBG] PrimaryPart:", primary:GetFullName())
+
+local warnedMissingNoseRef = false
+local noseRef
+local noseOffsetCF
+
+local function refWorldCFrame(ref)
+	if not ref then return nil end
+	if ref:IsA("Attachment") then return ref.WorldCFrame end
+	if ref:IsA("BasePart") then return ref.CFrame end
+	return nil
+end
+
+local function refWorldPosition(ref, fallback)
+	if not ref then return fallback end
+	if ref:IsA("Attachment") then return ref.WorldPosition end
+	if ref:IsA("BasePart") then return ref.Position end
+	return fallback
+end
+
+local function resolveNoseReference()
+	local noseAttachment = ship:FindFirstChild("NoseAttachment", true)
+	if noseAttachment and noseAttachment:IsA("Attachment") and noseAttachment.Parent and noseAttachment.Parent:IsA("BasePart") then
+		return noseAttachment
+	end
+
+	local frontPart = ship:FindFirstChild("FrontOfShip", true)
+	if frontPart and frontPart:IsA("BasePart") then
+		return frontPart
+	end
+
+	if not warnedMissingNoseRef then
+		warn(("[ShipScript] %s: NoseAttachment/FrontOfShip mancante, uso PrimaryPart come fallback temporaneo."):format(ship.Name))
+		warnedMissingNoseRef = true
+	end
+	return primary
+end
+
+local function getNoseBasisCF()
+	local refCF = refWorldCFrame(noseRef)
+	if refCF then return refCF end
+	if noseOffsetCF then return primary.CFrame * noseOffsetCF end
+	return primary.CFrame
+end
+
+noseRef = resolveNoseReference()
+local initialNoseCF = refWorldCFrame(noseRef)
+if initialNoseCF then
+	noseOffsetCF = primary.CFrame:ToObjectSpace(initialNoseCF)
+end
 
 -- ============================================================================
 -- WELD MODEL
@@ -775,7 +826,7 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 			if typeof(data.Direction) == "Vector3" then
 				return data.Direction.Unit
 			end
-			return primary.CFrame.LookVector
+			return getNoseBasisCF().LookVector
 		end
 
 		if #cannons > 0 then
@@ -791,7 +842,9 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 				end
 			end
 		else
-			local fb = primary.Position + primary.CFrame.LookVector * 8
+			local noseCF = getNoseBasisCF()
+			local nosePos = refWorldPosition(noseRef, primary.Position)
+			local fb = nosePos + noseCF.LookVector * 8
 			spawnLaser(fb, dirFrom(fb))
 		end
 		if fireSound and fireSound.SoundId ~= "" then fireSound:Play() end

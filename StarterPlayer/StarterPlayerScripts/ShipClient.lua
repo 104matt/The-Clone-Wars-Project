@@ -823,6 +823,10 @@ local state = {
 	ship     = nil,
 	seat     = nil,
 	primary  = nil,
+	noseRef  = nil,
+	noseOffsetCF = nil,
+	hangarForwardFlat = Vector3.zAxis,
+	hangarYawSign = 1,
 	gyro     = nil,
 	velocity = nil,
 	camPart  = nil,
@@ -906,6 +910,13 @@ local function readShipConfig(ship)
 	state.config.Faction     = ship:GetAttribute("Faction")     or "Republic"
 	state.config.FireSound   = ship:GetAttribute("FireSound")   or ""
 end
+
+local getNoseReference
+local refWorldCFrame
+local refWorldPosition
+local flatUnit
+local getNoseBasisCF
+local noseCFToPrimaryCF
 
 -- ============================================================================
 -- INPUT HELPERS
@@ -1028,8 +1039,9 @@ local function setMode(newMode)
 	state.mode = newMode
 
 	-- Inizializza camera orbita dalla nave
-	if state.primary then
-		local look = state.primary.CFrame.LookVector
+	local noseBasisCF = getNoseBasisCF()
+	if noseBasisCF then
+		local look = noseBasisCF.LookVector
 		state.hoverYaw   = math.atan2(-look.X, -look.Z)
 		state.hoverPitch = -0.15
 	end
@@ -1037,9 +1049,10 @@ local function setMode(newMode)
 	if newMode == "hangar" then
 		state.freeLook        = false
 		state.crosshairOffset = Vector2.zero
-		if state.primary then
-			local look = state.primary.CFrame.LookVector
+		if noseBasisCF then
+			local look = noseBasisCF.LookVector
 			state.hangarYaw = math.atan2(look.X, look.Z)
+			state.hangarForwardFlat = flatUnit(look, state.hangarForwardFlat)
 		end
 		HUD.Crosshair.Visible = false
 		hideTargetUI()
@@ -1049,9 +1062,9 @@ local function setMode(newMode)
 		state.aimPitch = 0
 		state.bank     = 0
 		state.roll     = 0
-		if state.primary then
-			state.flightVel = state.primary.CFrame.LookVector * state.currentSpeed
-			state.aimCFrame = state.primary.CFrame
+		if noseBasisCF then
+			state.flightVel = noseBasisCF.LookVector * state.currentSpeed
+			state.aimCFrame = noseBasisCF
 		end
 		HUD.Crosshair.Visible = true
 	end
@@ -1061,6 +1074,14 @@ local function startFlight(ship, seat)
 	state.ship      = ship
 	state.seat      = seat
 	state.primary   = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart")
+	state.noseRef   = getNoseReference(ship, state.primary)
+	state.noseOffsetCF = nil
+	if state.primary then
+		local noseCF = refWorldCFrame(state.noseRef)
+		if noseCF then
+			state.noseOffsetCF = state.primary.CFrame:ToObjectSpace(noseCF)
+		end
+	end
 	state.camPart   = ship:FindFirstChild("CameraPart", true)
 	state.zoomPart  = ship:FindFirstChild("ZoomPart",   true)
 	state.gyro      = state.primary and state.primary:WaitForChild("ShipGyro",     2)
@@ -1076,7 +1097,7 @@ local function startFlight(ship, seat)
 	state.bank            = 0
 	state.roll            = 0
 	state.flightVel       = Vector3.zero
-	state.aimCFrame       = state.primary and state.primary.CFrame or nil
+	state.aimCFrame       = refWorldCFrame(state.noseRef) or (state.primary and state.primary.CFrame or nil)
 	state.zoomMode        = false
 	state.freeLook        = false
 	state.lastShot        = -math.huge
@@ -1098,9 +1119,16 @@ local function startFlight(ship, seat)
 
 	readShipConfig(ship)
 
-	if state.primary then
-		local look = state.primary.CFrame.LookVector
+	local noseBasisCF = getNoseBasisCF()
+	if noseBasisCF then
+		local look = noseBasisCF.LookVector
+		local right = noseBasisCF.RightVector
+		local fwdFlat = flatUnit(look, Vector3.zAxis)
+		local rightFlat = flatUnit(right, Vector3.xAxis)
+		local expectedRight = flatUnit(Vector3.yAxis:Cross(fwdFlat), Vector3.xAxis)
 		state.hangarYaw  = math.atan2(look.X, look.Z)
+		state.hangarForwardFlat = fwdFlat
+		state.hangarYawSign = (rightFlat:Dot(expectedRight) >= 0) and 1 or -1
 		state.hoverYaw   = math.atan2(-look.X, -look.Z)
 		state.hoverPitch = -0.15
 		state.hoverDistance = 28
@@ -1157,6 +1185,8 @@ local function stopFlight()
 	state.ship     = nil
 	state.seat     = nil
 	state.primary  = nil
+	state.noseRef  = nil
+	state.noseOffsetCF = nil
 	state.gyro     = nil
 	state.velocity = nil
 	state.target   = nil
@@ -1167,6 +1197,64 @@ end
 
 local function smoothAlpha(lambda, dt)
 	return 1 - math.exp(-math.max(lambda, 0) * math.max(dt, 0))
+end
+
+local warnedMissingNoseRef = setmetatable({}, { __mode = "k" })
+
+getNoseReference = function(ship, primary)
+	local noseAttachment = ship and ship:FindFirstChild("NoseAttachment", true)
+	if noseAttachment and noseAttachment:IsA("Attachment") and noseAttachment.Parent and noseAttachment.Parent:IsA("BasePart") then
+		return noseAttachment
+	end
+
+	local frontPart = ship and ship:FindFirstChild("FrontOfShip", true)
+	if frontPart and frontPart:IsA("BasePart") then
+		return frontPart
+	end
+
+	if ship and primary and not warnedMissingNoseRef[ship] then
+		warn(("[ShipClient] %s: NoseAttachment/FrontOfShip mancante, uso PrimaryPart come fallback temporaneo."):format(ship.Name))
+		warnedMissingNoseRef[ship] = true
+	end
+	return primary
+end
+
+refWorldCFrame = function(ref)
+	if not ref then return nil end
+	if ref:IsA("Attachment") then return ref.WorldCFrame end
+	if ref:IsA("BasePart") then return ref.CFrame end
+	return nil
+end
+
+refWorldPosition = function(ref, fallback)
+	if not ref then return fallback end
+	if ref:IsA("Attachment") then return ref.WorldPosition end
+	if ref:IsA("BasePart") then return ref.Position end
+	return fallback
+end
+
+flatUnit = function(v, fallback)
+	local flat = Vector3.new(v.X, 0, v.Z)
+	local mag = flat.Magnitude
+	if mag > 1e-5 then
+		return flat / mag
+	end
+	return fallback
+end
+
+getNoseBasisCF = function()
+	if not state.primary then return nil end
+	local refCF = refWorldCFrame(state.noseRef)
+	if refCF then return refCF end
+	if state.noseOffsetCF then return state.primary.CFrame * state.noseOffsetCF end
+	return state.primary.CFrame
+end
+
+noseCFToPrimaryCF = function(noseCF)
+	if state.noseOffsetCF then
+		return noseCF * state.noseOffsetCF:Inverse()
+	end
+	return noseCF
 end
 
 local function springStep(curr, vel, target, stiffness, damping, dt)
@@ -1247,7 +1335,8 @@ RunService.RenderStepped:Connect(function(dt)
 	local inHangar   = (state.mode == "hangar")
 	local inFreeLook = (state.mode == "combat" and state.freeLook)
 	local zoomPart   = state.zoomPart
-	local shipPos    = state.primary.Position
+	local noseBasisCF = getNoseBasisCF() or state.primary.CFrame
+	local shipPos    = refWorldPosition(state.noseRef, state.primary.Position)
 	local profilePos, profileLook, profileUp
 
 	if inHangar or inFreeLook then
@@ -1260,7 +1349,7 @@ RunService.RenderStepped:Connect(function(dt)
 		profileUp = Vector3.yAxis
 	else
 		-- Combat chase indipendente da CameraPart.CFrame
-		local refCF = state.aimCFrame or state.primary.CFrame
+		local refCF = state.aimCFrame or noseBasisCF
 		local shipFwd = refCF.LookVector
 		local shipUp  = refCF.UpVector
 
@@ -1366,12 +1455,18 @@ RunService.RenderStepped:Connect(function(dt)
 			state.currentSpeed = math.max(state.currentSpeed - HANGAR_ACCEL * 0.4 * dt, 0)
 		end
 
-		state.hangarYaw = state.hangarYaw + rgtInput * HANGAR_TURN_RATE * dt
+		local yawDelta = rgtInput * state.hangarYawSign * HANGAR_TURN_RATE * dt
+		if math.abs(yawDelta) > 1e-6 then
+			local rot = CFrame.Angles(0, yawDelta, 0)
+			state.hangarForwardFlat = flatUnit(rot:VectorToWorldSpace(state.hangarForwardFlat), state.hangarForwardFlat)
+		end
 
-		-- muso = +LookVector. hangarYaw=0 → muso verso +Z
-		local noseDirFlat = Vector3.new(math.sin(state.hangarYaw), 0, math.cos(state.hangarYaw))
+		local noseDirFlat = flatUnit(state.hangarForwardFlat, Vector3.zAxis)
+		state.hangarYaw = math.atan2(noseDirFlat.X, noseDirFlat.Z)
+		local noseCF = CFrame.lookAt(shipPos, shipPos + noseDirFlat)
+		local desiredPrimaryCF = noseCFToPrimaryCF(noseCF)
 		if state.gyro then
-			state.gyro.CFrame = CFrame.lookAt(Vector3.zero, noseDirFlat)
+			state.gyro.CFrame = desiredPrimaryCF
 		end
 		if state.velocity then
 			state.velocity.Velocity = noseDirFlat * state.currentSpeed
@@ -1442,14 +1537,14 @@ RunService.RenderStepped:Connect(function(dt)
 		-- Gyro: muso = +LookVector + roll manuale + auto-bank
 		local baseCF    = CFrame.lookAt(Vector3.zero, noseDir)
 		local targetCF  = baseCF * CFrame.Angles(0, 0, state.roll + state.bank)
-		local desiredCF = CFrame.new(state.primary.Position) * (targetCF - targetCF.Position)
+		local desiredNoseCF = CFrame.new(shipPos) * (targetCF - targetCF.Position)
 
 		if not state.aimCFrame then
-			state.aimCFrame = state.primary.CFrame
+			state.aimCFrame = noseBasisCF
 		end
-		state.aimCFrame = state.aimCFrame:Lerp(desiredCF, 1 - math.exp(-AIM_LAMBDA * dt))
+		state.aimCFrame = state.aimCFrame:Lerp(desiredNoseCF, 1 - math.exp(-AIM_LAMBDA * dt))
 		if state.gyro then
-			state.gyro.CFrame = state.aimCFrame
+			state.gyro.CFrame = noseCFToPrimaryCF(state.aimCFrame)
 		end
 
 		-- Deriva inerziale
@@ -1475,9 +1570,9 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 
 		-- Muso reale nel mondo (modello rovesciato: muso = -LookVector)
-		local noseWorld = state.primary.CFrame.LookVector
+		local noseWorld = (getNoseBasisCF() or state.primary.CFrame).LookVector
 
-		local newTarget = pickTarget(state.candidates, noseWorld, state.primary.Position)
+		local newTarget = pickTarget(state.candidates, noseWorld, shipPos)
 		state.target = newTarget
 
 		if state.target then
@@ -1487,7 +1582,7 @@ RunService.RenderStepped:Connect(function(dt)
 			if tRoot then
 				local tPos  = tRoot.Position
 				local tVel  = tRoot.AssemblyLinearVelocity
-				local dist  = (tPos - state.primary.Position).Magnitude
+				local dist  = (tPos - shipPos).Magnitude
 
 				state.leadWorld  = tPos + tVel * (dist / LASER_SPEED)
 				local leadSP     = worldToScreen(state.leadWorld)
@@ -1571,8 +1666,9 @@ RunService.RenderStepped:Connect(function(dt)
 	local norm = 1 - (clampedY + 500) / 2000
 	HUD.AltNeedle.Position = UDim2.new(0.5, 0, norm, 0)
 
-	local look  = state.primary.CFrame.LookVector
-	local right = state.primary.CFrame.RightVector
+	local hudBasis = getNoseBasisCF() or state.primary.CFrame
+	local look  = hudBasis.LookVector
+	local right = hudBasis.RightVector
 	HUD.Pitch.Text   = string.format("%+.0f°", math.deg(math.asin(math.clamp(look.Y, -1, 1))))
 	HUD.Roll.Text    = string.format("%+.0f°", math.deg(math.asin(math.clamp(right.Y, -1, 1))))
 	HUD.Heading.Text = string.format("%03d°",  (math.deg(math.atan2(-look.X, -look.Z)) + 360) % 360)
@@ -1611,18 +1707,20 @@ local function tryShoot()
 	state.lastShot = now
 
 	-- Punto di convergenza: lungo il muso, alla distanza del bersaglio
-	local noseWorld = state.primary.CFrame.LookVector
+	local noseBasisCF = getNoseBasisCF() or state.primary.CFrame
+	local noseWorld = noseBasisCF.LookVector
+	local nosePos = refWorldPosition(state.noseRef, state.primary.Position)
 	local convDist  = DEFAULT_CONV_DIST
 
 	if state.target then
 		local tRoot = state.target:FindFirstChild("HumanoidRootPart")
 			or state.target:FindFirstChildWhichIsA("BasePart")
 		if tRoot then
-			convDist = (tRoot.Position - state.primary.Position).Magnitude
+			convDist = (tRoot.Position - nosePos).Magnitude
 		end
 	end
 
-	local converge = state.primary.Position + noseWorld * convDist
+	local converge = nosePos + noseWorld * convDist
 
 	-- Gimbal assist: se il lead e' entro GIMBAL_TOL_PX dal centro schermo,
 	-- spostiamo il convergence point verso il lead world
@@ -1689,7 +1787,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		if not state.ship or state.mode ~= "combat" then return end
 		state.freeLook = not state.freeLook
 		if state.freeLook then
-			local look = state.primary.CFrame.LookVector
+			local look = (getNoseBasisCF() or state.primary.CFrame).LookVector
 			state.hoverYaw   = math.atan2(-look.X, -look.Z)
 			state.hoverPitch = -0.15
 		end
