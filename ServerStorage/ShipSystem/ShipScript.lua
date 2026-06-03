@@ -25,6 +25,17 @@
 --   ShieldRegenDelay (number)  s. dopo l'ultimo hit prima di regen   default 4
 --   ShieldRegenRate  (number)  punti scudo / s di regen              default 20
 --
+-- SUONI (Attribute = solo l'ID numerico o "rbxassetid://..."):
+--   GetInSound       quando il player entra nella nave            (one-shot)
+--   TurnOn           quando il pilota accende il motore (R)       (one-shot)
+--   TurnOff          quando il pilota spegne il motore (R)        (one-shot)
+--   FireSound        ad ogni colpo dei cannoni                    (one-shot)
+--   ShipSound        ambient motore, loop durante engine ON       (loop)
+--   HyperdriveSound  quando entri in hyperdrive (N)               (one-shot)
+--
+-- Defaults integrati: se la nave si chiama "ARC-170" e non ha l'Attribute
+-- relativo, lo script usa l'ID di default per quella nave (vedi SHIP_SOUND_DEFAULTS).
+--
 -- Cannoni: il sistema rileva automaticamente Laser1, Laser2, Laser3, ...
 -- nel Model. Non c'e' limite hardcoded.
 
@@ -67,7 +78,9 @@ if not laserTemplate then
 	end)
 end
 
-local fireSound -- forward declaration: assegnata in fondo allo script
+local fireSound       -- forward declaration: assegnata in fondo allo script
+local turnOnSound, turnOffSound, getInSound, shipSound, hyperdriveSound
+local playOneShot     -- forward declaration: setEngine la usa, definita sotto
 
 -- ============================================================================
 -- CONFIG  (letta dagli Attributi del Model, con default sensati)
@@ -78,12 +91,53 @@ local function attr(name, default)
 	return v
 end
 
+-- Default suoni per nave specifica. Lo script li usa SOLO se l'Attribute
+-- corrispondente non e' impostato sul Model. Cosi' uno puo' sovrascriverli
+-- in Studio quando vuole. Aggiungi qui nuove navi in futuro.
+local SHIP_SOUND_DEFAULTS = {
+	["ARC-170"] = {
+		GetInSound      = 105966537536689,
+		TurnOn          = 90765152008789,
+		TurnOff         = 79557556820924,
+		FireSound       = 97781007184418,
+		ShipSound       = 89291410626502,
+		HyperdriveSound = 86925955851170,
+	},
+}
+
+-- Normalizza qualunque input (numero o stringa con/senza prefisso) in un SoundId
+-- valido del tipo "rbxassetid://N". Restituisce "" se l'input e' nullo/vuoto.
+local function toSoundId(v)
+	if v == nil or v == "" then return "" end
+	if typeof(v) == "number" then return "rbxassetid://" .. v end
+	local s = tostring(v)
+	if s:match("^rbxassetid://") then return s end
+	if s:match("^%d+$")           then return "rbxassetid://" .. s end
+	return s  -- e.g. "rbxasset://..." o URL completo lasciato com'e'
+end
+
+-- Risolve un Attribute suono con fallback a SHIP_SOUND_DEFAULTS[ship.Name][name].
+local function soundAttr(name)
+	local v = ship:GetAttribute(name)
+	if v == nil or v == "" then
+		local d = SHIP_SOUND_DEFAULTS[ship.Name]
+		if d then v = d[name] end
+	end
+	return toSoundId(v)
+end
+
 local CONFIG = {
-	Damage      = attr("Damage", 30),
-	MaxSpeed    = attr("MaxSpeed", 150),
-	FireSound   = attr("FireSound", ""),
-	ReloadSpeed = attr("ReloadSpeed", 0.18),
-	CanHover    = attr("CanHover", false),
+	Damage          = attr("Damage", 30),
+	MaxSpeed        = attr("MaxSpeed", 150),
+	ReloadSpeed     = attr("ReloadSpeed", 0.18),
+	CanHover        = attr("CanHover", false),
+	-- Suoni risolti via Attribute con fallback alla tabella di default
+	FireSound       = soundAttr("FireSound"),
+	GetInSound      = soundAttr("GetInSound"),
+	TurnOn          = soundAttr("TurnOn"),
+	TurnOff         = soundAttr("TurnOff"),
+	ShipSound       = soundAttr("ShipSound"),
+	HyperdriveSound = soundAttr("HyperdriveSound"),
 }
 
 -- Aggiorna live se uno modifica gli attributi in Studio
@@ -91,10 +145,19 @@ ship:GetAttributeChangedSignal("Damage"):Connect(function()      CONFIG.Damage  
 ship:GetAttributeChangedSignal("MaxSpeed"):Connect(function()    CONFIG.MaxSpeed    = attr("MaxSpeed", 150)    end)
 ship:GetAttributeChangedSignal("ReloadSpeed"):Connect(function() CONFIG.ReloadSpeed = attr("ReloadSpeed", 0.18) end)
 ship:GetAttributeChangedSignal("CanHover"):Connect(function()    CONFIG.CanHover    = attr("CanHover", false)  end)
-ship:GetAttributeChangedSignal("FireSound"):Connect(function()
-	CONFIG.FireSound = attr("FireSound", "")
-	if fireSound then fireSound.SoundId = CONFIG.FireSound end
-end)
+
+local function bindSoundAttr(attrName, target)
+	ship:GetAttributeChangedSignal(attrName):Connect(function()
+		CONFIG[attrName] = soundAttr(attrName)
+		if target() then target().SoundId = CONFIG[attrName] end
+	end)
+end
+bindSoundAttr("FireSound",       function() return fireSound end)
+bindSoundAttr("GetInSound",      function() return getInSound end)
+bindSoundAttr("TurnOn",          function() return turnOnSound end)
+bindSoundAttr("TurnOff",         function() return turnOffSound end)
+bindSoundAttr("ShipSound",       function() return shipSound end)
+bindSoundAttr("HyperdriveSound", function() return hyperdriveSound end)
 
 -- ============================================================================
 -- RESOLVE PARTS
@@ -384,29 +447,60 @@ local function setEngine(on)
 		shipVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 		shipVelocity.Velocity = Vector3.zero
 		for _, t in ipairs(engineTrails) do t.Enabled = true end
+		-- Audio: TurnOn one-shot + ShipSound looped ambient
+		playOneShot(turnOnSound)
+		if shipSound and shipSound.SoundId ~= "" and not shipSound.IsPlaying then
+			shipSound:Play()
+		end
 	else
 		shipVelocity.Velocity = Vector3.zero
 		shipVelocity.MaxForce = Vector3.new(0, 0, 0)
 		shipGyro.MaxTorque    = Vector3.new(0, 0, 0)
 		primary.Anchored      = true
 		for _, t in ipairs(engineTrails) do t.Enabled = false end
+		-- Audio: stop ambient + TurnOff one-shot
+		if shipSound and shipSound.IsPlaying then shipSound:Stop() end
+		playOneShot(turnOffSound)
 	end
 end
 
 -- ============================================================================
--- FIRE SOUND
+-- SOUNDS
 -- ============================================================================
-do
-	local s = primary:FindFirstChild("FireSound")
+-- Tutti i suoni 3D sono parentati al primary (posizionali, attenuano con la
+-- distanza). Riusiamo Sound child esistenti se gia' presenti col giusto nome.
+local function makeSound(name, soundId, opts)
+	opts = opts or {}
+	local s = primary:FindFirstChild(name)
 	if not s or not s:IsA("Sound") then
 		if s then s:Destroy() end
-		s = Instance.new("Sound")
-		s.Name   = "FireSound"
-		s.Volume = 1
+		s        = Instance.new("Sound")
+		s.Name   = name
 		s.Parent = primary
 	end
-	s.SoundId = CONFIG.FireSound
-	fireSound = s
+	s.SoundId          = soundId or ""
+	s.Volume           = opts.Volume or 1
+	s.Looped           = opts.Looped or false
+	s.RollOffMode      = opts.RollOffMode or Enum.RollOffMode.InverseTapered
+	s.RollOffMinDistance = opts.MinDist or 10
+	s.RollOffMaxDistance = opts.MaxDist or 250
+	return s
+end
+
+fireSound       = makeSound("FireSound",       CONFIG.FireSound,       { Volume = 1 })
+getInSound      = makeSound("GetInSound",      CONFIG.GetInSound,      { Volume = 0.9, MaxDist = 60 })
+turnOnSound     = makeSound("TurnOn",          CONFIG.TurnOn,          { Volume = 1 })
+turnOffSound    = makeSound("TurnOff",         CONFIG.TurnOff,         { Volume = 1 })
+shipSound       = makeSound("ShipSound",       CONFIG.ShipSound,       { Volume = 0.6, Looped = true, MaxDist = 400 })
+hyperdriveSound = makeSound("HyperdriveSound", CONFIG.HyperdriveSound, { Volume = 1, MaxDist = 350 })
+
+-- Assegna alla forward declaration in alto (NON usare 'local function' qui
+-- altrimenti shadowiamo).
+playOneShot = function(s)
+	if s and s.SoundId ~= "" then
+		s.TimePosition = 0
+		s:Play()
+	end
 end
 
 -- ============================================================================
@@ -453,15 +547,19 @@ local function onEnter()
 	-- Cabina pilotata: posizione di combattimento (ali APERTE in X), niente trails
 	updateWings(true)
 	setSfoilTrails(false)
+	-- Audio: suono di ingresso pilota
+	playOneShot(getInSound)
 	prompt.Enabled = false
 end
 
 local function onExit()
-	setEngine(false)
+	setEngine(false)            -- spegne anche shipSound + suona TurnOff
 	pcall(function() primary:SetNetworkOwner(nil) end)
 	-- Parcheggio: ali chiuse, no trails
 	updateWings(false)
 	setSfoilTrails(false)
+	-- Hyperdrive si annulla all'uscita (visualmente gia' chiuso, qui solo flag)
+	hyperdriveActive = false
 	prompt.Enabled = true
 end
 
@@ -692,9 +790,14 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 		--   data.State = true  -> entra in hyperdrive (ali chiuse, trails, no armi)
 		--   data.State = false -> torna in attack (ali aperte X, armi)
 		local hyper = data.State == true
+		local wasHyper = hyperdriveActive
 		hyperdriveActive = hyper
 		updateWings(not hyper)
 		setSfoilTrails(hyper)
+		-- Audio: suona solo quando ENTRI in hyperdrive (not -> active)
+		if hyper and not wasHyper then
+			playOneShot(hyperdriveSound)
+		end
 
 	elseif action == "EngineToggle" then
 		setEngine(data.State == true)
