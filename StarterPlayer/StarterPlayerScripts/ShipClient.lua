@@ -317,6 +317,48 @@ local function buildHud()
 		Parent                 = hoverChip,
 	})
 
+	-- ---- TOP-LEFT (sotto InfoCard): Boost gauge -------------------------
+	local boostCard = new("Frame", {
+		Name                   = "Boost",
+		Position               = UDim2.fromOffset(28, 28 + 96 + 8),
+		Size                   = UDim2.fromOffset(280, 28),
+		BackgroundColor3       = PALETTE.panel,
+		BackgroundTransparency = 0.3,
+		BorderSizePixel        = 0,
+		Parent                 = gui,
+	})
+	corner(boostCard, 4)
+	stroke(boostCard, PALETTE.primaryDim, 1, 0.3)
+
+	new("TextLabel", {
+		Position               = UDim2.fromOffset(12, 8),
+		Size                   = UDim2.fromOffset(60, 14),
+		BackgroundTransparency = 1,
+		Font                   = Enum.Font.GothamBold,
+		TextSize               = 10,
+		TextColor3             = PALETTE.textDim,
+		TextXAlignment         = Enum.TextXAlignment.Left,
+		Text                   = "BOOST",
+		Parent                 = boostCard,
+	})
+
+	local boostBarBg = new("Frame", {
+		Position               = UDim2.fromOffset(72, 10),
+		Size                   = UDim2.new(1, -84, 0, 8),
+		BackgroundColor3       = PALETTE.bg,
+		BorderSizePixel        = 0,
+		Parent                 = boostCard,
+	})
+	corner(boostBarBg, 3)
+
+	local boostBarFill = new("Frame", {
+		Size                   = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3       = PALETTE.accent,
+		BorderSizePixel        = 0,
+		Parent                 = boostBarBg,
+	})
+	corner(boostBarFill, 3)
+
 	-- ---- BOTTOM-LEFT: Speedometer ----------------------------------------
 	local speedCard = new("Frame", {
 		Name                   = "Speed",
@@ -394,7 +436,7 @@ local function buildHud()
 		Name                   = "Controls",
 		AnchorPoint            = Vector2.new(1, 1),
 		Position               = UDim2.new(1, -28, 1, -28 - 240 - 12),
-		Size                   = UDim2.fromOffset(180, 260),
+		Size                   = UDim2.fromOffset(180, 314),  -- aumentato per ospitare V e SHIFT
 		BackgroundColor3       = PALETTE.panel,
 		BackgroundTransparency = 0.25,
 		BorderSizePixel        = 0,
@@ -482,15 +524,17 @@ local function buildHud()
 		return row
 	end
 
-	controlRow(1, "R",     "Engine")
-	controlRow(2, "W S",   "Accel/Brake")
-	controlRow(3, "A D",   "Roll")
-	controlRow(4, "Q E",   "Down/Up")
+	controlRow(1,  "R",     "Engine")
+	controlRow(2,  "W S",   "Accel/Brake")
+	controlRow(3,  "A D",   "Roll")
+	controlRow(4,  "Q E",   "Down/Up")
 	local qeRow = nil  -- riga Q/E ora sempre visibile (vale anche in flight)
-	controlRow(5, "N",     "Toggle Mode")
-	controlRow(6, "LMB",   "Fire")
-	controlRow(7, "RMB",   "Zoom Aim")
-	controlRow(8, "WHEEL", "Cam Zoom")
+	controlRow(5,  "SHIFT", "Boost")
+	controlRow(6,  "V",     "Cockpit View")
+	controlRow(7,  "N",     "Toggle Mode")
+	controlRow(8,  "LMB",   "Fire")
+	controlRow(9,  "RMB",   "Zoom Aim")
+	controlRow(10, "WHEEL", "Cam Zoom")
 
 	-- ---- BOTTOM-RIGHT: Altitude ------------------------------------------
 	local altCard = new("Frame", {
@@ -700,6 +744,7 @@ local function buildHud()
 		HitFlash       = hitFlash,
 		ControlsCard   = ctrlCard,
 		QERow          = qeRow,
+		BoostFill      = boostBarFill,
 	}
 end
 
@@ -758,6 +803,26 @@ local FLIGHT_CHASE_BACK   = 22     -- offset chase-cam dietro la nave se manca C
 local FLIGHT_CHASE_UP     = 7
 local AIM_TURN_SMOOTH     = 8      -- snappy ma non instantaneo
 
+-- Boost / afterburner (Shift)
+local BOOST_MULTIPLIER    = 1.7    -- moltiplicatore di fullMax quando attivo
+local BOOST_DRAIN_PER_SEC = 0.35   -- gauge drain (1.0 gauge = piena)
+local BOOST_REGEN_PER_SEC = 0.18   -- gauge regen quando rilasciato
+local BOOST_MIN_TO_START  = 0.10   -- soglia per attivare boost
+local BOOST_FOV_BONUS     = 12     -- FOV extra a boost pieno
+local BASE_FOV            = 70     -- FOV "a regime"
+
+-- Camera recoil (kick quando si spara)
+local RECOIL_KICK_BACK    = 0.5    -- studs di kick indietro per colpo
+local RECOIL_KICK_PITCH   = 0.018  -- radianti di kick verso l'alto per colpo
+local RECOIL_DECAY        = 11     -- lambda damping del recoil verso zero
+local RECOIL_MAX_BACK     = 2.5    -- cap del kick accumulato
+local RECOIL_MAX_PITCH    = 0.09
+
+-- Cockpit camera (V per toggle chase <-> cockpit)
+local COCKPIT_FORWARD     = 1.5    -- offset avanti dalla CFrame della CockpitPart
+local COCKPIT_UP          = 0.5
+local COCKPIT_FOV         = 80     -- FOV in cockpit (piu' wide)
+
 local state = {
 	ship           = nil,
 	seat           = nil,
@@ -788,6 +853,19 @@ local state = {
 
 	-- zoom / aim
 	zoomMode       = false,
+
+	-- camera view (chase <-> cockpit) -- gestito con V
+	camView        = "chase",         -- "chase" | "cockpit"
+	cockpitPart    = nil,
+
+	-- camera recoil (decay per-frame)
+	recoilBack     = 0,
+	recoilPitch    = 0,
+
+	-- boost / afterburner (hold Shift)
+	boost          = 1,               -- 0..1 gauge
+	boostActive    = false,
+	boostFactor    = 1,                -- 1..BOOST_MULTIPLIER (smoothed)
 
 	-- shooting
 	shooting       = false,
@@ -858,8 +936,9 @@ local function startFlight(ship, seat)
 	state.ship      = ship
 	state.seat      = seat
 	state.primary   = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart")
-	state.camPart   = ship:FindFirstChild("CameraPart", true)
-	state.zoomPart  = ship:FindFirstChild("ZoomPart",   true)
+	state.camPart    = ship:FindFirstChild("CameraPart",  true)
+	state.zoomPart   = ship:FindFirstChild("ZoomPart",    true)
+	state.cockpitPart = ship:FindFirstChild("CockpitPart", true)  -- opzionale: se manca, fallback su PrimaryPart
 	state.gyro      = state.primary and state.primary:WaitForChild("ShipGyro",     2)
 	state.velocity  = state.primary and state.primary:WaitForChild("ShipVelocity", 2)
 	state.sfoils    = false
@@ -871,6 +950,14 @@ local function startFlight(ship, seat)
 	state.zoomMode  = false
 	state.lastShot  = -math.huge
 
+	-- reset vista/boost/recoil ad ogni entrata
+	state.camView     = "chase"
+	state.recoilBack  = 0
+	state.recoilPitch = 0
+	state.boost       = 1
+	state.boostActive = false
+	state.boostFactor = 1
+
 	readShipConfig(ship)
 
 	-- HUD: setup + reveal
@@ -881,7 +968,7 @@ local function startFlight(ship, seat)
 	HUD.Gui.Enabled       = true
 
 	-- Reveal animation (telemetry slides in)
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then
 			local target = card.Position
@@ -900,14 +987,16 @@ end
 
 local function stopFlight()
 	if state.seat == nil then return end
-	camera.CameraType = Enum.CameraType.Custom
-	mouse.TargetFilter = nil
+	camera.CameraType   = Enum.CameraType.Custom
+	camera.FieldOfView  = BASE_FOV  -- ripristina FOV (potrebbe essere alterato da cockpit/boost)
+	mouse.TargetFilter  = nil
 	setMouseLocked(false)
 	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
 	if hum then hum.CameraOffset = Vector3.zero end
+	state.boostActive = false
 
 	-- HUD fade out
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then tween(card, 0.2, { BackgroundTransparency = 1 }) end
 	end
@@ -967,6 +1056,23 @@ RunService.RenderStepped:Connect(function(dt)
 	local zoomPart = state.zoomPart
 	local camPart  = state.camPart
 
+	-- Decay del camera recoil verso zero (frame-rate independent)
+	state.recoilBack  = damp(state.recoilBack,  0, RECOIL_DECAY, dt)
+	state.recoilPitch = damp(state.recoilPitch, 0, RECOIL_DECAY, dt)
+
+	-- Regen del boost gauge (sempre attivo quando NON stai boostando)
+	if not state.boostActive and state.boost < 1 then
+		state.boost = math.min(1, state.boost + BOOST_REGEN_PER_SEC * dt)
+	end
+
+	-- Smoothing del boost factor verso il target (per FOV/velocita' senza scatti)
+	local targetBoostFactor = (state.boostActive and state.boost > 0)
+		and (1 + (BOOST_MULTIPLIER - 1) * math.clamp(state.boost, 0, 1))
+		or 1
+	state.boostFactor = damp(state.boostFactor, targetBoostFactor, 8, dt)
+
+	local cockpitPart = state.cockpitPart
+
 	if state.zoomMode and zoomPart then
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = zoomPart.CFrame
@@ -978,6 +1084,25 @@ RunService.RenderStepped:Connect(function(dt)
 		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
+	elseif state.camView == "cockpit" then
+		-- Cockpit view: dentro l'abitacolo, guarda fuori dal muso.
+		-- Convenzione di questo progetto: il muso e' sul -LookVector del
+		-- PrimaryPart, ovvero sul +Z locale. Per posizionarsi al muso
+		-- traslo di +COCKPIT_FORWARD lungo Z. Per guardare fuori, ruoto
+		-- 180 gradi attorno a Y cosi' il LookVector della camera coincide
+		-- con il -LookVector della nave (la direzione di marcia).
+		--
+		-- Se in Studio metti una CockpitPart gia' orientata correttamente,
+		-- la usiamo direttamente.
+		camera.CameraType = Enum.CameraType.Scriptable
+		if cockpitPart then
+			camera.CFrame = cockpitPart.CFrame
+		else
+			local p = state.primary
+			camera.CFrame = p.CFrame
+				* CFrame.new(0, COCKPIT_UP, COCKPIT_FORWARD)
+				* CFrame.Angles(0, math.pi, 0)
+		end
 	else
 		-- Camera chase: la CameraPart E' la camera. Usiamo la sua CFrame
 		-- completa (posizione + orientazione). Il wheel-zoom scorre lungo
@@ -996,6 +1121,19 @@ RunService.RenderStepped:Connect(function(dt)
 			camera.CFrame = CFrame.lookAt(camPos, shipPos + shipFwd * 200, shipUp)
 		end
 	end
+
+	-- Camera recoil + boost FOV: applicati sopra qualsiasi base CFrame scelta.
+	-- Recoil: kick indietro lungo +Z locale (la camera "rincula") + pitch in alto.
+	if state.recoilBack ~= 0 or state.recoilPitch ~= 0 then
+		camera.CFrame = camera.CFrame
+			* CFrame.new(0, 0, state.recoilBack)
+			* CFrame.Angles(state.recoilPitch, 0, 0)
+	end
+
+	-- FOV: cockpit piu' wide; boost allarga ulteriormente
+	local baseFov   = (state.camView == "cockpit") and COCKPIT_FOV or BASE_FOV
+	local boostFov  = (state.boostFactor - 1) / math.max(BOOST_MULTIPLIER - 1, 0.001) * BOOST_FOV_BONUS
+	camera.FieldOfView = baseFov + boostFov
 
 	mouse.TargetFilter = state.ship
 
@@ -1060,9 +1198,18 @@ RunService.RenderStepped:Connect(function(dt)
 		--   S  = frena   (la velocita' scende verso 0, mai negativa)
 		--   nessuno dei due = mantiene la velocita' corrente (drift)
 		--   Q/E = spinta verticale up/down sempre attiva in volo
-		local fullMax    = maxSpeed * (state.sfoils and FULL_SPEED_FACTOR or CRUISE_SPEED_FACTOR)
-		local accelRate  = maxSpeed * 0.7
-		local brakeRate  = maxSpeed * 1.4
+		--   Shift = boost: moltiplica fullMax per state.boostFactor (drena gauge)
+		local baseFullMax = maxSpeed * (state.sfoils and FULL_SPEED_FACTOR or CRUISE_SPEED_FACTOR)
+		local fullMax     = baseFullMax * state.boostFactor
+		local accelRate   = maxSpeed * 0.7 * state.boostFactor
+		local brakeRate   = maxSpeed * 1.4
+
+		-- Drain del boost gauge (regen e' gestito fuori dal ramo flight cosi'
+		-- ricarica anche in hover / engine off).
+		if state.boostActive and state.boost > 0 then
+			state.boost = math.max(0, state.boost - BOOST_DRAIN_PER_SEC * dt)
+			if state.boost <= 0 then state.boostActive = false end
+		end
 
 		if fwdInput > 0 then
 			state.currentSpeed = state.currentSpeed + accelRate * dt
@@ -1150,7 +1297,7 @@ RunService.RenderStepped:Connect(function(dt)
 	HUD.Roll.Text    = string.format("%+.0f°", math.deg(math.asin(math.clamp(right.Y, -1, 1))))
 	HUD.Heading.Text = string.format("%03d°",  (math.deg(math.atan2(-look.X, -look.Z)) + 360) % 360)
 
-	-- Mode chip
+	-- Mode chip (mostra anche vista cockpit e stato boost)
 	local newMode
 	if not state.engineOn then
 		newMode = "ENGINE OFF"
@@ -1165,8 +1312,25 @@ RunService.RenderStepped:Connect(function(dt)
 		newMode = "CRUISE"
 		HUD.ModeChip.BackgroundColor3 = PALETTE.primary
 	end
+	if state.mode == "flight" and state.camView == "cockpit" then
+		newMode = newMode .. " · COCKPIT"
+	end
+	if state.boostActive and state.boost > 0 then
+		newMode = newMode .. " · BOOST"
+		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
+	end
 	if HUD.ModeLabel.Text ~= newMode then
 		HUD.ModeLabel.Text = newMode
+	end
+
+	-- Boost bar fill + colore (cyan piena, ambra in scarica, rosso a secco)
+	HUD.BoostFill.Size = UDim2.new(math.clamp(state.boost, 0, 1), 0, 1, 0)
+	if state.boost <= 0.001 then
+		HUD.BoostFill.BackgroundColor3 = PALETTE.danger
+	elseif state.boostActive then
+		HUD.BoostFill.BackgroundColor3 = PALETTE.accent
+	else
+		HUD.BoostFill.BackgroundColor3 = PALETTE.primary
 	end
 
 	-- Reticle: in hover non aiming col cursore, smorziamo il reticolo
@@ -1191,6 +1355,11 @@ local function tryShoot()
 	local dir = (targetPos - state.primary.Position).Unit
 	ShipEvent:FireServer("Shoot", { Direction = dir })
 	pulseRingOnFire()
+
+	-- Camera recoil: piccola scossa indietro + leggero pitch in alto.
+	-- Si accumula sui colpi rapidi (capped) e decade nel render loop.
+	state.recoilBack  = math.min(state.recoilBack  + RECOIL_KICK_BACK,  RECOIL_MAX_BACK)
+	state.recoilPitch = math.min(state.recoilPitch + RECOIL_KICK_PITCH, RECOIL_MAX_PITCH)
 end
 
 UserInputService.InputBegan:Connect(function(input, processed)
@@ -1221,6 +1390,19 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		end
 		ShipEvent:FireServer("EngineToggle", { State = state.engineOn })
 
+	elseif input.KeyCode == Enum.KeyCode.V then
+		-- Toggle vista: chase <-> cockpit. Solo in flight (hover ha gia' free orbit).
+		if not state.ship or state.mode ~= "flight" then return end
+		state.camView = (state.camView == "cockpit") and "chase" or "cockpit"
+
+	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+		-- Hold Shift = boost (afterburner). Si attiva solo sopra la soglia minima
+		-- e drena finche' tenuto premuto o finche' la gauge si svuota.
+		if not state.ship or state.mode ~= "flight" or not state.engineOn then return end
+		if state.boost >= BOOST_MIN_TO_START then
+			state.boostActive = true
+		end
+
 	elseif input.KeyCode == Enum.KeyCode.N then
 		if not state.ship then return end
 		if state.config.CanHover then
@@ -1247,6 +1429,8 @@ UserInputService.InputEnded:Connect(function(input)
 		state.shooting = false
 	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
 		state.zoomMode = false
+	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+		state.boostActive = false
 	end
 end)
 
