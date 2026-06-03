@@ -95,10 +95,21 @@ local cameraPart = ship:FindFirstChild("CameraPart", true)
 local zoomPart   = ship:FindFirstChild("ZoomPart",   true)
 local laser1     = ship:FindFirstChild("Laser1",     true)
 local laser2     = ship:FindFirstChild("Laser2",     true)
+local laser3     = ship:FindFirstChild("Laser3",     true)
+local laser4     = ship:FindFirstChild("Laser4",     true)
 local leftWing   = ship:FindFirstChild("LeftWing",      true)
 local rightWing  = ship:FindFirstChild("RightWing",     true)
 local openLeft   = ship:FindFirstChild("OpenLeftWing",  true)
 local openRight  = ship:FindFirstChild("OpenRightWing", true)
+
+-- Cannoni: ordine di rotazione del fuoco (TL, TR, BL, BR nel video).
+-- Usa quelli che trova; se solo 2 ne hai, alterna fra i due.
+local cannons = {}
+if laser1 then table.insert(cannons, laser1) end
+if laser2 then table.insert(cannons, laser2) end
+if laser3 then table.insert(cannons, laser3) end
+if laser4 then table.insert(cannons, laser4) end
+local cannonIndex = 0
 
 if not ship.PrimaryPart then
 	ship.PrimaryPart = (vehicleSeat:IsA("BasePart") and vehicleSeat)
@@ -180,13 +191,15 @@ local function setGroupTransparency(group, t)
 	end
 end
 
-local function updateWings(open)
-	setGroupTransparency(leftWing,  open and 1 or 0)
-	setGroupTransparency(rightWing, open and 1 or 0)
-	setGroupTransparency(openLeft,  open and 0 or 1)
-	setGroupTransparency(openRight, open and 0 or 1)
+-- attackPosition = true  -> ali APERTE in X (cruise/combat)
+-- attackPosition = false -> ali CHIUSE parallele (hyperdrive/travel/stowed)
+local function updateWings(attackPosition)
+	setGroupTransparency(leftWing,  attackPosition and 1 or 0)  -- chiuse visibili quando NON attack
+	setGroupTransparency(rightWing, attackPosition and 1 or 0)
+	setGroupTransparency(openLeft,  attackPosition and 0 or 1)  -- aperte visibili quando attack
+	setGroupTransparency(openRight, attackPosition and 0 or 1)
 end
-updateWings(false)
+updateWings(false)  -- stato iniziale: parcheggio (ali chiuse)
 
 -- ============================================================================
 -- ENGINE TRAIL
@@ -425,12 +438,16 @@ local function onEnter()
 	-- Motore spento all'ingresso: la nave resta ferma finche' il pilota non
 	-- preme R (gestito dal client tramite ShipEvent "EngineToggle").
 	setEngine(false)
+	-- Cabina pilotata: posizione di combattimento (ali APERTE in X), niente trails
+	updateWings(true)
+	setSfoilTrails(false)
 	prompt.Enabled = false
 end
 
 local function onExit()
 	setEngine(false)
 	pcall(function() primary:SetNetworkOwner(nil) end)
+	-- Parcheggio: ali chiuse, no trails
 	updateWings(false)
 	setSfoilTrails(false)
 	prompt.Enabled = true
@@ -513,6 +530,9 @@ local LASER_LIFETIME      = 5
 local lastShot            = 0
 local BULLETS_FOLDER_NAME = "ShipBullets"
 
+-- Stato hyperdrive: quando true, ali chiuse + trails + alta velocita' + ARMI OFF.
+local hyperdriveActive = false
+
 local function getBulletsFolder()
 	local f = Workspace:FindFirstChild(BULLETS_FOLDER_NAME)
 	if not f then
@@ -573,7 +593,6 @@ local function spawnLaser(originPos, direction)
 			if hit then
 				laser.CFrame = CFrame.lookAt(hit.Position, hit.Position + direction)
 				-- 1) Nave colpita: danno a scudi -> scafo via Attributes.
-				-- Il suo ShipScript ascolta CurrentHealth/Shields e replica all'HUD.
 				local hitShip = findShipModelFrom(hit.Instance)
 				if hitShip and hitShip ~= ship then
 					local s    = hitShip:GetAttribute("CurrentShields") or 0
@@ -595,6 +614,15 @@ local function spawnLaser(originPos, direction)
 						hum:TakeDamage(CONFIG.Damage)
 					end
 				end
+
+				-- Effetto cinematografico al punto d'impatto (visuale, niente forza)
+				local exp = Instance.new("Explosion")
+				exp.Position                   = hit.Position
+				exp.BlastRadius                = 0
+				exp.BlastPressure              = 0
+				exp.DestroyJointRadiusPercent  = 0
+				exp.Visible                    = true
+				exp.Parent                     = Workspace
 				break
 			end
 
@@ -614,15 +642,20 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 
 	if action == "Shoot" then
 		if typeof(data.Direction) ~= "Vector3" then return end
+		-- Armi DISABILITATE in hyperdrive (ali chiuse, modalita' travel).
+		if hyperdriveActive then return end
+
 		local now = os.clock()
 		if now - lastShot < CONFIG.ReloadSpeed then return end
 		lastShot = now
 
 		local dir = data.Direction.Unit
-		local fired = false
-		if laser1 then spawnLaser(laser1.Position, dir); fired = true end
-		if laser2 then spawnLaser(laser2.Position, dir); fired = true end
-		if not fired then
+		-- 4-cannon cycle: TL -> TR -> BL -> BR -> TL ... (o sequenza dei cannoni
+		-- effettivamente presenti nel modello). Ogni colpo da un singolo cannone.
+		if #cannons > 0 then
+			cannonIndex = (cannonIndex % #cannons) + 1
+			spawnLaser(cannons[cannonIndex].Position, dir)
+		else
 			spawnLaser(primary.Position + primary.CFrame.LookVector * 8, dir)
 		end
 		if fireSound and fireSound.SoundId ~= "" then
@@ -630,10 +663,13 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 		end
 
 	elseif action == "ToggleSfoils" then
-		local open = data.State == true
-		updateWings(open)
-		-- Sfoil trails accese solo a foils APERTE (= esci da cruise)
-		setSfoilTrails(open)
+		-- N (toggle s-foils) ora alterna ATTACK <-> HYPERDRIVE:
+		--   data.State = true  -> entra in hyperdrive (ali chiuse, trails, no armi)
+		--   data.State = false -> torna in attack (ali aperte X, armi)
+		local hyper = data.State == true
+		hyperdriveActive = hyper
+		updateWings(not hyper)
+		setSfoilTrails(hyper)
 
 	elseif action == "EngineToggle" then
 		setEngine(data.State == true)

@@ -588,7 +588,7 @@ local function buildHud()
 	controlRow(5,  "SHIFT", "Boost")
 	controlRow(6,  "V",     "Free Cam")
 	controlRow(7,  "TAB",   "Lock Target")
-	controlRow(8,  "N",     "Toggle Mode")
+	controlRow(8,  "N",     "Hyperdrive")
 	controlRow(9,  "LMB",   "Fire")
 	controlRow(10, "RMB",   "Zoom Aim")
 	controlRow(11, "WHEEL", "Cam Zoom")
@@ -872,6 +872,14 @@ local BOOST_REGEN_PER_SEC = 0.18   -- gauge regen quando rilasciato
 local BOOST_MIN_TO_START  = 0.10   -- soglia per attivare boost
 local BOOST_FOV_BONUS     = 12     -- FOV extra a boost pieno
 local BASE_FOV            = 70     -- FOV "a regime"
+
+-- Hyperdrive (N premuto in flight = ali chiuse, max speed, FOV wider, armi off)
+local HYPERDRIVE_FOV_BONUS = 10    -- FOV extra in hyperdrive
+local HYPERDRIVE_SPEED_MUL = 1.8   -- moltiplicatore di fullMax in hyperdrive
+
+-- Auto-banking: la nave si inclina automaticamente nelle curve
+local AUTO_BANK_AMOUNT     = 1.1   -- max roll target in radianti (~63 gradi)
+local AUTO_BANK_LERP       = 6     -- velocita' con cui converge al target
 
 -- Camera recoil (kick quando si spara)
 local RECOIL_KICK_BACK    = 0.5    -- studs di kick indietro per colpo
@@ -1342,9 +1350,10 @@ RunService.RenderStepped:Connect(function(dt)
 			* CFrame.Angles(state.recoilPitch, 0, 0)
 	end
 
-	-- FOV: boost allarga il FOV. Free cam tiene il BASE_FOV.
-	local boostFov  = (state.boostFactor - 1) / math.max(BOOST_MULTIPLIER - 1, 0.001) * BOOST_FOV_BONUS
-	camera.FieldOfView = BASE_FOV + boostFov
+	-- FOV: boost + hyperdrive allargano. Free cam tiene il BASE_FOV.
+	local boostFov     = (state.boostFactor - 1) / math.max(BOOST_MULTIPLIER - 1, 0.001) * BOOST_FOV_BONUS
+	local hyperFov     = (state.sfoils and state.engineOn) and HYPERDRIVE_FOV_BONUS or 0
+	camera.FieldOfView = BASE_FOV + boostFov + hyperFov
 
 	mouse.TargetFilter = state.ship
 
@@ -1408,9 +1417,11 @@ RunService.RenderStepped:Connect(function(dt)
 		--   W  = accelera (la velocita' sale verso fullMax)
 		--   S  = frena   (la velocita' scende verso 0, mai negativa)
 		--   nessuno dei due = mantiene la velocita' corrente (drift)
-		--   Q/E = spinta verticale up/down sempre attiva in volo
+		--   Q/E = spinta verticale up/down (solo cruise)
 		--   Shift = boost: moltiplica fullMax per state.boostFactor (drena gauge)
-		local baseFullMax = maxSpeed * (state.sfoils and FULL_SPEED_FACTOR or CRUISE_SPEED_FACTOR)
+		--   sfoils ATTIVE = HYPERDRIVE: max speed * HYPERDRIVE_SPEED_MUL
+		local speedMul    = state.sfoils and HYPERDRIVE_SPEED_MUL or CRUISE_SPEED_FACTOR
+		local baseFullMax = maxSpeed * speedMul
 		local fullMax     = baseFullMax * state.boostFactor
 		local accelRate   = maxSpeed * 0.7 * state.boostFactor
 		local brakeRate   = maxSpeed * 1.4
@@ -1429,13 +1440,29 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 		state.currentSpeed = math.clamp(state.currentSpeed, 0, fullMax)
 
-		-- Roll da A/D: positivo = banking a destra (D)
+		-- Roll: A/D override manuale; senza input, AUTO-BANKING in base alla
+		-- componente laterale dell'aim (la nave si inclina nelle curve come
+		-- nei film).
 		if rgtInput ~= 0 then
 			state.rollAngle = state.rollAngle - rgtInput * 0.18
-			state.rollAngle = math.clamp(state.rollAngle, -1.2, 1.2)
+			state.rollAngle = math.clamp(state.rollAngle, -1.4, 1.4)
 		else
-			local a = state.rollAngle
-			state.rollAngle = a - math.sign(a) * math.min(math.abs(a), dt * 4)
+			-- Auto-bank: misura "quanto sto virando" dalla proiezione di aimDir
+			-- sul RightVector della nave. Se aim e' a destra -> bank a destra.
+			local autoTarget = 0
+			if state.camView ~= "free" and state.primary then
+				local mp = mouse.Hit.Position
+				if mouse.Target == nil then
+					mp = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
+				end
+				local aim = (mp - state.primary.Position)
+				if aim.Magnitude > 0.01 then
+					local lateral = aim.Unit:Dot(state.primary.CFrame.RightVector)
+					autoTarget = -math.clamp(lateral, -1, 1) * AUTO_BANK_AMOUNT
+				end
+			end
+			state.rollAngle = state.rollAngle
+				+ (autoTarget - state.rollAngle) * (1 - math.exp(-AUTO_BANK_LERP * dt))
 		end
 
 		-- Aim verso il cursore in chase. In free cam invece l'heading e'
@@ -1525,10 +1552,10 @@ RunService.RenderStepped:Connect(function(dt)
 		newMode = "HOVER"
 		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
 	elseif state.sfoils then
-		newMode = "FULL THROTTLE"
-		HUD.ModeChip.BackgroundColor3 = PALETTE.good
+		newMode = "HYPERDRIVE"
+		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
 	else
-		newMode = "CRUISE"
+		newMode = "ATTACK"
 		HUD.ModeChip.BackgroundColor3 = PALETTE.primary
 	end
 	if state.mode == "flight" and state.camView == "free" then
@@ -1556,8 +1583,9 @@ RunService.RenderStepped:Connect(function(dt)
 	--   - chase normale  -> posizione del cursore
 	--   - free cam       -> proiezione del muso (centro schermo)
 	--   - hover          -> nascosto (non si spara in hover)
+	--   - hyperdrive     -> nascosto (armi disattivate)
 	--   - lock-on attivo -> nascosto, LeadReticle prende il suo posto
-	if state.mode ~= "flight" or (state.leadPoint and state.lockedHrp and state.lockedHrp.Parent) then
+	if state.mode ~= "flight" or state.sfoils or (state.leadPoint and state.lockedHrp and state.lockedHrp.Parent) then
 		HUD.Reticle.Visible = false
 	else
 		HUD.Reticle.Visible = true
@@ -1633,6 +1661,7 @@ end)
 local function tryShoot()
 	if not state.ship or not state.primary then return end
 	if state.mode == "hover" then return end  -- in hover non si spara
+	if state.sfoils then return end           -- hyperdrive: armi disattivate
 	local now = os.clock()
 	if now - state.lastShot < state.config.ReloadSpeed then return end
 	state.lastShot = now
@@ -1691,8 +1720,8 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		ShipEvent:FireServer("EngineToggle", { State = state.engineOn })
 
 	elseif input.KeyCode == Enum.KeyCode.Tab then
-		-- Tab cicla i target nemici nel cono frontale.
-		if state.ship then cycleLockTarget() end
+		-- Tab cicla i target nemici nel cono frontale (solo in attack, no in hyperdrive).
+		if state.ship and not state.sfoils then cycleLockTarget() end
 
 	elseif input.KeyCode == Enum.KeyCode.V then
 		-- Toggle vista: chase <-> free orbit. Solo in flight (hover ha gia' free orbit).
