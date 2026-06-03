@@ -95,6 +95,12 @@ local cameraPart = ship:FindFirstChild("CameraPart", true)
 local zoomPart   = ship:FindFirstChild("ZoomPart",   true)
 local laser1     = ship:FindFirstChild("Laser1",     true)
 local laser2     = ship:FindFirstChild("Laser2",     true)
+
+print(("[ShipScript][%s] BOOT  Laser1=%s  Laser2=%s"):format(
+	ship.Name,
+	laser1 and laser1:GetFullName() or "MISSING",
+	laser2 and laser2:GetFullName() or "MISSING"
+))
 local leftWing   = ship:FindFirstChild("LeftWing",      true)
 local rightWing  = ship:FindFirstChild("RightWing",     true)
 local openLeft   = ship:FindFirstChild("OpenLeftWing",  true)
@@ -460,6 +466,13 @@ local LASER_LIFETIME = 5
 local lastShot       = 0
 local BULLETS_FOLDER_NAME = "ShipBullets"
 
+-- Mettilo a false una volta sistemato lo sparo. Quando true stampa ogni step
+-- di spawnLaser per individuare dove muore.
+local LASER_DEBUG    = true
+local function ldbg(...)
+	if LASER_DEBUG then print("[ShipScript][" .. ship.Name .. "][LASER]", ...) end
+end
+
 local function getBulletsFolder()
 	local f = Workspace:FindFirstChild(BULLETS_FOLDER_NAME)
 	if not f then
@@ -488,7 +501,9 @@ end
 -- Il template del proiettile sta in ReplicatedStorage.FlightEvents.LaserBolt.
 -- Lo cloniamo, lo orientiamo verso la direzione di tiro, gli appiccichiamo
 -- una LinearVelocity e gestiamo collisione/danno.
-local function spawnLaser(originPos, direction)
+local function spawnLaserInternal(originPos, direction)
+	ldbg("spawnLaser ENTER  origin=", originPos, " dir=", direction)
+
 	-- Lazy-resolve nel caso il template sia stato aggiunto dopo l'avvio.
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
 		laserTemplate = resolveLaserTemplate()
@@ -499,7 +514,15 @@ local function spawnLaser(originPos, direction)
 		return
 	end
 
+	-- Sanity check direction: se e' (0,0,0) o NaN, lookAt esploderebbe
+	if direction.Magnitude < 1e-3 or direction.X ~= direction.X then
+		warn("[ShipScript] direction invalida:", direction)
+		return
+	end
+
+	ldbg("cloning template...")
 	local laser = laserTemplate:Clone()
+	ldbg("clone ok:", laser.ClassName, " transparency=", laser.Transparency, " size=", laser.Size)
 	laser.Name       = "ShipLaser"
 	laser.Anchored   = false
 	laser.CanCollide = false
@@ -507,6 +530,7 @@ local function spawnLaser(originPos, direction)
 	laser.CanTouch   = true
 	laser.Massless   = true
 	laser.CFrame     = CFrame.lookAt(originPos, originPos + direction)
+	ldbg("CFrame set, position=", laser.Position)
 
 	-- Usiamo (o creiamo) un Attachment per la LinearVelocity. Se il template
 	-- ha gia' un Attachment chiamato "Tail" lo riusiamo.
@@ -526,8 +550,10 @@ local function spawnLaser(originPos, direction)
 	lv.RelativeTo     = Enum.ActuatorRelativeTo.World
 	lv.VectorVelocity = direction * LASER_SPEED
 	lv.Parent         = laser
+	ldbg("LinearVelocity attaccata, velocity=", lv.VectorVelocity)
 
 	laser.Parent = getBulletsFolder()
+	ldbg("PARENTED in", laser.Parent and laser.Parent:GetFullName() or "<nil>")
 
 	local conn
 	conn = laser.Touched:Connect(function(other)
@@ -544,6 +570,19 @@ local function spawnLaser(originPos, direction)
 	end)
 
 	Debris:AddItem(laser, LASER_LIFETIME)
+end
+
+-- Wrapper: cattura QUALSIASI errore in spawnLaserInternal e lo stampa con
+-- traceback completo, cosi' anche se qualcosa nel template (vincolo strano,
+-- script figlio che fallisce sul clone, ecc.) tira giu' la chiamata,
+-- vediamo cos'e' successo.
+local function spawnLaser(originPos, direction)
+	local ok, err = xpcall(function()
+		spawnLaserInternal(originPos, direction)
+	end, debug.traceback)
+	if not ok then
+		warn("[ShipScript][" .. ship.Name .. "] spawnLaser ERROR:\n" .. tostring(err))
+	end
 end
 
 ShipEvent.OnServerEvent:Connect(function(player, action, data)
