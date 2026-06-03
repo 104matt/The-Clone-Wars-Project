@@ -22,24 +22,8 @@ local Workspace         = game:GetService("Workspace")
 local Debris            = game:GetService("Debris")
 
 local ship          = script.Parent
-
--- FlightEvents/ShipEvent: NON aspettiamo all'infinito ShipBootstrap. Se la
--- cartella o il RemoteEvent mancano, li creiamo qui. Cosi' la nave si inizializza
--- (e si salda) anche senza ShipBootstrap nel posto, e il client li riceve via
--- replica appena esistono.
-local function ensureChild(parent, name, className)
-	local c = parent:FindFirstChild(name)
-	if not c or not c:IsA(className) then
-		if c then c:Destroy() end
-		c = Instance.new(className)
-		c.Name   = name
-		c.Parent = parent
-	end
-	return c
-end
-
-local FlightEvents  = ensureChild(ReplicatedStorage, "FlightEvents", "Folder")
-local ShipEvent     = ensureChild(FlightEvents, "ShipEvent", "RemoteEvent")
+local FlightEvents  = ReplicatedStorage:WaitForChild("FlightEvents")
+local ShipEvent     = FlightEvents:WaitForChild("ShipEvent")
 -- LaserBolt e' un Part configurato in Studio dall'utente. WaitForChild con
 -- timeout: se manca, lasciamo che spawnLaser stampi un warn invece di
 -- bloccare l'intera inizializzazione della nave.
@@ -62,7 +46,7 @@ local CONFIG = {
 	FireSound   = attr("FireSound", ""),
 	ReloadSpeed = attr("ReloadSpeed", 0.18),
 	CanHover    = attr("CanHover", false),
-	Faction     = attr("Faction", "Republic"),  -- evita fuoco amico sui laser
+	Faction     = attr("Faction", "Republic"),  -- usato per evitare fuoco amico
 }
 
 -- Aggiorna live se uno modifica gli attributi in Studio
@@ -171,33 +155,25 @@ local function setGroupTransparency(group, t)
 	end
 end
 
--- Trail/particelle di PUNTA D'ALA: accese SOLO in combat (ali aperte).
--- Sono opzionali: cerchiamo nel modello ogni Trail/ParticleEmitter/Beam che sta
--- dentro una part il cui nome contiene "WingTip" o "WingTrail", oppure che si
--- chiama "WingTrail*". Se non ne trovi, la funzione e' un no-op silenzioso.
-local function isWingtipEmitter(obj)
-	if not (obj:IsA("Trail") or obj:IsA("ParticleEmitter") or obj:IsA("Beam")) then
-		return false
+-- Wingtip trails: Trail/ParticleEmitter presenti dentro OpenLeftWing / OpenRightWing.
+-- Sono OFF in modalita' Hangar, ON in modalita' Combat (sfoils aperti).
+local wingtipTrails = {}
+local function collectWingtipTrails()
+	for _, group in ipairs({ openLeft, openRight }) do
+		if group then
+			for _, d in ipairs(group:GetDescendants()) do
+				if d:IsA("Trail") or d:IsA("ParticleEmitter") then
+					table.insert(wingtipTrails, d)
+				end
+			end
+		end
 	end
-	if obj.Name:match("^WingTrail") or obj.Name:match("^WingTip") then
-		return true
-	end
-	local p = obj:FindFirstAncestorWhichIsA("BasePart")
-	if p then
-		local n = p.Name
-		if n:match("WingTip") or n:match("WingTrail") then return true end
-	end
-	return false
 end
-
-local wingtipEmitters = {}
-for _, d in ipairs(ship:GetDescendants()) do
-	if isWingtipEmitter(d) then table.insert(wingtipEmitters, d) end
-end
+collectWingtipTrails()
 
 local function setWingtipTrails(on)
-	for _, e in ipairs(wingtipEmitters) do
-		e.Enabled = on
+	for _, t in ipairs(wingtipTrails) do
+		t.Enabled = on
 	end
 end
 
@@ -206,7 +182,6 @@ local function updateWings(open)
 	setGroupTransparency(rightWing, open and 1 or 0)
 	setGroupTransparency(openLeft,  open and 0 or 1)
 	setGroupTransparency(openRight, open and 0 or 1)
-	-- Combat (ali aperte) => trail di punta accesi; Hangar => spenti.
 	setWingtipTrails(open)
 end
 updateWings(false)
@@ -444,9 +419,10 @@ local function spawnLaser(originPos, direction)
 	conn = laser.Touched:Connect(function(other)
 		if other:IsDescendantOf(ship) then return end
 		local model = other:FindFirstAncestorOfClass("Model")
-		-- Niente fuoco amico: salta i bersagli della stessa fazione della nave.
-		if model and model:GetAttribute("Faction") == CONFIG.Faction then return end
-		local hum   = model and model:FindFirstChildOfClass("Humanoid")
+		if not model then return end
+		-- Salta modelli della stessa fazione (fuoco amico)
+		if model:GetAttribute("Faction") == CONFIG.Faction then return end
+		local hum = model:FindFirstChildOfClass("Humanoid")
 		if hum and hum.Health > 0 then
 			hum:TakeDamage(CONFIG.Damage)
 		end
@@ -466,35 +442,27 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 	if action == "Shoot" then
 		local now = os.clock()
 		if now - lastShot < CONFIG.ReloadSpeed then return end
-
-		-- CONVERGENZA: il client invia un punto-mondo (Converge) dove le canne
-		-- d'ala devono incrociare il fuoco. Ogni canna spara verso quel punto,
-		-- quindi i raggi NON sono paralleli ma puntano "verso dentro".
-		-- Fallback: vecchio comportamento con Direction parallela.
-		local converge = (typeof(data.Converge) == "Vector3") and data.Converge or nil
-		local dir      = (typeof(data.Direction) == "Vector3") and data.Direction.Unit or nil
-		if not converge and not dir then return end
 		lastShot = now
 
-		local function dirFrom(originPart)
-			if converge then
-				local d = converge - originPart.Position
-				if d.Magnitude > 0.001 then return d.Unit end
+		-- Calcola direzione di fuoco per ogni cannone.
+		-- Se il client manda un punto di convergenza (data.Converge) usiamo
+		-- vettori per-cannone che convergono su quel punto (gimbal/convergenza).
+		-- Fallback a data.Direction se Converge non e' disponibile.
+		local function dirFrom(originPos)
+			if typeof(data.Converge) == "Vector3" then
+				return (data.Converge - originPos).Unit
+			elseif typeof(data.Direction) == "Vector3" then
+				return data.Direction.Unit
 			end
-			return dir or (-primary.CFrame.LookVector)
+			return -primary.CFrame.LookVector  -- muso della nave (LookVector invertito)
 		end
 
 		local fired = false
-		if laser1 then spawnLaser(laser1.Position, dirFrom(laser1)); fired = true end
-		if laser2 then spawnLaser(laser2.Position, dirFrom(laser2)); fired = true end
+		if laser1 then spawnLaser(laser1.Position, dirFrom(laser1.Position)); fired = true end
+		if laser2 then spawnLaser(laser2.Position, dirFrom(laser2.Position)); fired = true end
 		if not fired then
-			local muzzle = primary.Position + primary.CFrame.LookVector * 8
-			local d = dir
-			if converge then
-				local v = converge - muzzle
-				if v.Magnitude > 0.001 then d = v.Unit end
-			end
-			spawnLaser(muzzle, d or (-primary.CFrame.LookVector))
+			local fallback = primary.Position + primary.CFrame.LookVector * 8
+			spawnLaser(fallback, dirFrom(fallback))
 		end
 		if fireSound and fireSound.SoundId ~= "" then
 			fireSound:Play()
