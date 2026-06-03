@@ -11,11 +11,22 @@
 --   OpenLeftWing, OpenRightWing  ali aperte  (Part o Model)
 --
 -- Configurazione della nave: Attributi sul Model (Properties -> Attributes):
---   Damage      (number)    danno per colpo                  default 30
---   MaxSpeed    (number)    velocita' massima in volo        default 150
---   FireSound   (string)    "rbxassetid://..." del cannone   default vuoto
---   ReloadSpeed (number)    secondi tra le raffiche          default 0.18
---   CanHover    (boolean)   abilita modalita' hover (N)      default false
+--   Damage           (number)  danno per colpo                       default 30
+--   MaxSpeed         (number)  velocita' massima in volo             default 150
+--   FireSound        (string)  "rbxassetid://..." del cannone        default vuoto
+--   ReloadSpeed      (number)  secondi tra le raffiche               default 0.18
+--   CanHover         (boolean) abilita modalita' hover (N)           default false
+--   CannonsPerShot   (number)  quanti cannoni sparano per colpo:     default 0 (= tutti)
+--                              0 o >= #cannoni -> tutti simultanei (ARC-170 twin laser)
+--                              1               -> uno alla volta, cicla (X-Wing video)
+--                              N               -> N alla volta, in batch ciclanti
+--   MaxHealth        (number)  HP scafo max                          default 100
+--   MaxShields       (number)  scudi max                             default 100
+--   ShieldRegenDelay (number)  s. dopo l'ultimo hit prima di regen   default 4
+--   ShieldRegenRate  (number)  punti scudo / s di regen              default 20
+--
+-- Cannoni: il sistema rileva automaticamente Laser1, Laser2, Laser3, ...
+-- nel Model. Non c'e' limite hardcoded.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
@@ -93,22 +104,23 @@ assert(vehicleSeat, ("[ShipScript] %s: VehicleSeat mancante."):format(ship.Name)
 
 local cameraPart = ship:FindFirstChild("CameraPart", true)
 local zoomPart   = ship:FindFirstChild("ZoomPart",   true)
-local laser1     = ship:FindFirstChild("Laser1",     true)
-local laser2     = ship:FindFirstChild("Laser2",     true)
-local laser3     = ship:FindFirstChild("Laser3",     true)
-local laser4     = ship:FindFirstChild("Laser4",     true)
 local leftWing   = ship:FindFirstChild("LeftWing",      true)
 local rightWing  = ship:FindFirstChild("RightWing",     true)
 local openLeft   = ship:FindFirstChild("OpenLeftWing",  true)
 local openRight  = ship:FindFirstChild("OpenRightWing", true)
 
--- Cannoni: ordine di rotazione del fuoco (TL, TR, BL, BR nel video).
--- Usa quelli che trova; se solo 2 ne hai, alterna fra i due.
+-- Cannoni: auto-detect di Laser1, Laser2, Laser3, ... fino al primo gap.
+-- Funziona per qualunque numero di cannoni (2 per ARC-170, 4 per X-Wing, ecc.).
 local cannons = {}
-if laser1 then table.insert(cannons, laser1) end
-if laser2 then table.insert(cannons, laser2) end
-if laser3 then table.insert(cannons, laser3) end
-if laser4 then table.insert(cannons, laser4) end
+do
+	local i = 1
+	while true do
+		local c = ship:FindFirstChild("Laser" .. i, true)
+		if not c then break end
+		table.insert(cannons, c)
+		i = i + 1
+	end
+end
 local cannonIndex = 0
 
 if not ship.PrimaryPart then
@@ -650,11 +662,24 @@ ShipEvent.OnServerEvent:Connect(function(player, action, data)
 		lastShot = now
 
 		local dir = data.Direction.Unit
-		-- 4-cannon cycle: TL -> TR -> BL -> BR -> TL ... (o sequenza dei cannoni
-		-- effettivamente presenti nel modello). Ogni colpo da un singolo cannone.
+		-- Quanti cannoni per colpo? Attribute CannonsPerShot:
+		--   0 (default) o >= #cannoni -> tutti simultanei (ARC-170 twin laser)
+		--   1                          -> uno alla volta, cicla
+		--   N (1 <= N < #cannoni)      -> N alla volta, batch ciclanti
 		if #cannons > 0 then
-			cannonIndex = (cannonIndex % #cannons) + 1
-			spawnLaser(cannons[cannonIndex].Position, dir)
+			local perShot = ship:GetAttribute("CannonsPerShot") or 0
+			if perShot <= 0 or perShot >= #cannons then
+				-- Volley: tutti i cannoni sparano insieme.
+				for _, c in ipairs(cannons) do
+					spawnLaser(c.Position, dir)
+				end
+			else
+				-- Batch ciclico di N cannoni.
+				for _ = 1, perShot do
+					cannonIndex = (cannonIndex % #cannons) + 1
+					spawnLaser(cannons[cannonIndex].Position, dir)
+				end
+			end
 		else
 			spawnLaser(primary.Position + primary.CFrame.LookVector * 8, dir)
 		end
