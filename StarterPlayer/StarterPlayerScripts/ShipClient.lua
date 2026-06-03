@@ -59,6 +59,7 @@ local MAX_PITCH         = math.rad(80)
 
 local BANK_MAX          = math.rad(60)
 local BANK_LAMBDA       = 4
+local ROLL_RATE         = 2.2     -- rad/sec A/D in combat (dice roll)
 local AIM_LAMBDA        = 6
 local DRIFT_LAMBDA      = 2.4
 
@@ -827,6 +828,7 @@ local state = {
 	aimYaw   = 0,
 	aimPitch = 0,
 	bank     = 0,
+	roll     = 0,  -- roll manuale A/D (accumulato, 360° libero)
 
 	-- Combat: velocita' inerziale (drift)
 	flightVel = Vector3.zero,
@@ -1010,6 +1012,7 @@ local function setMode(newMode)
 		state.aimYaw   = state.hangarYaw
 		state.aimPitch = 0
 		state.bank     = 0
+		state.roll     = 0
 		if state.primary then
 			state.flightVel = state.primary.CFrame.LookVector * state.currentSpeed
 			state.aimCFrame = state.primary.CFrame
@@ -1035,6 +1038,7 @@ local function startFlight(ship, seat)
 	state.aimYaw          = 0
 	state.aimPitch        = 0
 	state.bank            = 0
+	state.roll            = 0
 	state.flightVel       = Vector3.zero
 	state.aimCFrame       = state.primary and state.primary.CFrame or nil
 	state.zoomMode        = false
@@ -1236,29 +1240,32 @@ RunService.RenderStepped:Connect(function(dt)
 			Vector2.zero, 1 - math.exp(-CROSSHAIR_RETURN * dt)
 		)
 
-		-- Integra yaw/pitch
-		local cxNorm = state.crosshairOffset.X / CROSSHAIR_MAX_R
-		local cyNorm = state.crosshairOffset.Y / CROSSHAIR_MAX_R
+		-- Roll manuale A/D (continuo, 360° liberi)
+		state.roll = state.roll - rgtInput * ROLL_RATE * dt
+
+		-- Integra yaw/pitch dal crosshair (X negato: mouse destra → gira destra)
+		local cxNorm = -state.crosshairOffset.X / CROSSHAIR_MAX_R
+		local cyNorm =  state.crosshairOffset.Y / CROSSHAIR_MAX_R
 		local prevAimYaw = state.aimYaw
 		state.aimYaw   = state.aimYaw   + cxNorm * YAW_RATE  * dt
 		state.aimPitch = math.clamp(state.aimPitch - cyNorm * PITCH_RATE * dt, -MAX_PITCH, MAX_PITCH)
 
-		-- Auto-bank proporzionale al yaw rate
+		-- Auto-bank proporzionale al yaw rate (si somma al roll manuale)
 		local yawRate    = (state.aimYaw - prevAimYaw) / math.max(dt, 0.001)
 		local targetBank = -(yawRate / YAW_RATE) * BANK_MAX
 		state.bank = state.bank + (targetBank - state.bank) * (1 - math.exp(-BANK_LAMBDA * dt))
 		state.bank = math.clamp(state.bank, -BANK_MAX, BANK_MAX)
 
-		-- Direzione muso dai Euler (aimYaw=0,aimPitch=0 → -Z)
+		-- Direzione muso dai Euler
 		local cy = math.cos(state.aimYaw)
 		local sy = math.sin(state.aimYaw)
 		local cp = math.cos(state.aimPitch)
 		local sp = math.sin(state.aimPitch)
 		local noseDir = Vector3.new(sy * cp, sp, cy * cp)
 
-		-- Gyro: muso = +LookVector + bank
+		-- Gyro: muso = +LookVector + roll manuale + auto-bank
 		local baseCF    = CFrame.lookAt(Vector3.zero, noseDir)
-		local targetCF  = baseCF * CFrame.Angles(0, 0, state.bank)
+		local targetCF  = baseCF * CFrame.Angles(0, 0, state.roll + state.bank)
 		local desiredCF = CFrame.new(state.primary.Position) * (targetCF - targetCF.Position)
 
 		if not state.aimCFrame then
@@ -1533,7 +1540,7 @@ UserInputService.InputChanged:Connect(function(input, processed)
 			state.hoverYaw   = state.hoverYaw   - input.Delta.X * 0.005
 			state.hoverPitch = math.clamp(state.hoverPitch - input.Delta.Y * 0.005, -1.45, 1.45)
 		elseif state.mode == "combat" then
-			-- Deflessione crosshair
+			-- Deflessione crosshair (X non negato: la negazione avviene in cxNorm)
 			local newOffset = state.crosshairOffset
 				+ Vector2.new(input.Delta.X, input.Delta.Y) * CROSSHAIR_SENS
 			local mag = newOffset.Magnitude
