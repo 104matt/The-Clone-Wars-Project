@@ -1,58 +1,49 @@
--- ShipScript.lua  (Script per-nave)
--- Posizione: una copia di questo Script va piazzata DENTRO ogni Model nave
--- in Workspace (es. Workspace.arc170.ShipScript).
+-- ShipScript.lua  (Script per-nave)  -- DEBUG BUILD --
+-- Base: commit 663b986 (audio completo, raycast laser, health/shields).
+-- Aggiunte: Faction/fuoco amico, Converge per-cannone, wingtip trails.
 --
 -- Struttura attesa del Model nave:
 --   VehicleSeat                  unico modo per salire (ProximityPrompt)
 --   CameraPart                   anchor camera inseguimento
 --   ZoomPart                     anchor camera mira
---   Laser1, Laser2               canne dei cannoni
---   LeftWing, RightWing          ali chiuse  (Part o Model)
---   OpenLeftWing, OpenRightWing  ali aperte  (Part o Model)
+--   Laser1, Laser2, ...          canne dei cannoni (auto-detect)
+--   LeftWing, RightWing          ali chiuse  (Hangar)
+--   OpenLeftWing, OpenRightWing  ali aperte  (Combat) - wingtip trails qui dentro
+--   TrailPart (x N)              sfoil trails aggiuntivi (opzionali)
+--   Engine, Engine1...           parti motore (engine trail auto)
 --
--- Configurazione della nave: Attributi sul Model (Properties -> Attributes):
---   Damage           (number)  danno per colpo                       default 30
---   MaxSpeed         (number)  velocita' massima in volo             default 150
---   FireSound        (string)  "rbxassetid://..." del cannone        default vuoto
---   ReloadSpeed      (number)  secondi tra le raffiche               default 0.18
---   CanHover         (boolean) abilita modalita' hover (N)           default false
---   CannonsPerShot   (number)  quanti cannoni sparano per colpo:     default 0 (= tutti)
---                              0 o >= #cannoni -> tutti simultanei (ARC-170 twin laser)
---                              1               -> uno alla volta, cicla (X-Wing video)
---                              N               -> N alla volta, in batch ciclanti
---   MaxHealth        (number)  HP scafo max                          default 100
---   MaxShields       (number)  scudi max                             default 100
---   ShieldRegenDelay (number)  s. dopo l'ultimo hit prima di regen   default 4
---   ShieldRegenRate  (number)  punti scudo / s di regen              default 20
+-- Attributi sul Model (Properties -> Attributes):
+--   Damage           (number)   default 30
+--   MaxSpeed         (number)   default 150
+--   ReloadSpeed      (number)   default 0.18
+--   CanHover         (boolean)  default false
+--   Faction          (string)   default "Republic"  <- evita fuoco amico
+--   CannonsPerShot   (number)   default 0 (tutti simultanei)
+--   MaxHealth        (number)   default 100
+--   MaxShields       (number)   default 100
+--   ShieldRegenDelay (number)   default 4
+--   ShieldRegenRate  (number)   default 20
 --
--- SUONI (Attribute = solo l'ID numerico o "rbxassetid://..."):
---   GetInSound       quando il player entra nella nave            (one-shot)
---   TurnOn           quando il pilota accende il motore (R)       (one-shot)
---   TurnOff          quando il pilota spegne il motore (R)        (one-shot)
---   FireSound        ad ogni colpo dei cannoni                    (one-shot)
---   ShipSound        ambient motore, loop durante engine ON       (loop)
---   HyperdriveSound  quando entri in hyperdrive (N)               (one-shot)
---
--- Defaults integrati: se la nave si chiama "ARC-170" e non ha l'Attribute
--- relativo, lo script usa l'ID di default per quella nave (vedi SHIP_SOUND_DEFAULTS).
---
--- Cannoni: il sistema rileva automaticamente Laser1, Laser2, Laser3, ...
--- nel Model. Non c'e' limite hardcoded.
+-- SUONI (Attribute = ID numerico o "rbxassetid://..."):
+--   GetInSound / TurnOn / TurnOff / FireSound / ShipSound / HyperdriveSound
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
 local Debris            = game:GetService("Debris")
 
-local ship          = script.Parent
-local FlightEvents  = ReplicatedStorage:WaitForChild("FlightEvents")
-local ShipEvent     = FlightEvents:WaitForChild("ShipEvent")
+local ship = script.Parent
+print("[DBG] ShipScript avviato su:", ship:GetFullName())
 
--- LaserBolt template lookup, PER-NAVE:
---   FlightEvents.<NomeModelloNave>.LaserBolt   (preferito)
---   FlightEvents.LaserBolt                     (fallback legacy / globale)
--- "NomeModelloNave" e' una Folder o Model dentro FlightEvents con stesso
--- nome del Model nave (es. "ARC-170"). Dentro deve esserci una BasePart
--- chiamata "LaserBolt".
+-- ============================================================================
+-- FlightEvents / ShipEvent
+-- ============================================================================
+print("[DBG] In attesa di FlightEvents...")
+local FlightEvents = ReplicatedStorage:WaitForChild("FlightEvents")
+print("[DBG] FlightEvents OK")
+local ShipEvent = FlightEvents:WaitForChild("ShipEvent")
+print("[DBG] ShipEvent OK")
+
+-- LaserBolt: cerca prima FlightEvents/<NomeNave>/LaserBolt, poi globale.
 local function resolveLaserTemplate()
 	local perShip = FlightEvents:FindFirstChild(ship.Name)
 	if perShip then
@@ -65,25 +56,28 @@ local function resolveLaserTemplate()
 end
 
 local laserTemplate = resolveLaserTemplate()
-if not laserTemplate then
-	-- Riprova in modo asincrono: il template potrebbe arrivare dopo l'avvio.
+if laserTemplate then
+	print("[DBG] LaserBolt trovato:", laserTemplate:GetFullName())
+else
+	warn("[DBG] LaserBolt non trovato, riprovo in background...")
 	task.spawn(function()
 		for _ = 1, 30 do
 			task.wait(0.5)
 			laserTemplate = resolveLaserTemplate()
-			if laserTemplate then return end
+			if laserTemplate then
+				print("[DBG] LaserBolt trovato (ritardato):", laserTemplate:GetFullName())
+				return
+			end
 		end
-		warn(("[ShipScript] %s: nessun LaserBolt trovato in FlightEvents.%s o FlightEvents.LaserBolt.")
-			:format(ship.Name, ship.Name))
+		warn(("[ShipScript] %s: nessun LaserBolt trovato."):format(ship.Name))
 	end)
 end
 
-local fireSound       -- forward declaration: assegnata in fondo allo script
-local turnOnSound, turnOffSound, getInSound, shipSound, hyperdriveSound
-local playOneShot     -- forward declaration: setEngine la usa, definita sotto
+local fireSound, turnOnSound, turnOffSound, getInSound, shipSound, hyperdriveSound
+local playOneShot  -- forward declaration (usata da setEngine, definita dopo makeSound)
 
 -- ============================================================================
--- CONFIG  (letta dagli Attributi del Model, con default sensati)
+-- CONFIG
 -- ============================================================================
 local function attr(name, default)
 	local v = ship:GetAttribute(name)
@@ -91,9 +85,7 @@ local function attr(name, default)
 	return v
 end
 
--- Default suoni per nave specifica. Lo script li usa SOLO se l'Attribute
--- corrispondente non e' impostato sul Model. Cosi' uno puo' sovrascriverli
--- in Studio quando vuole. Aggiungi qui nuove navi in futuro.
+-- Default suoni per nave. Usati se l'Attribute non e' impostato.
 local SHIP_SOUND_DEFAULTS = {
 	["ARC-170"] = {
 		GetInSound      = 105966537536689,
@@ -105,18 +97,15 @@ local SHIP_SOUND_DEFAULTS = {
 	},
 }
 
--- Normalizza qualunque input (numero o stringa con/senza prefisso) in un SoundId
--- valido del tipo "rbxassetid://N". Restituisce "" se l'input e' nullo/vuoto.
 local function toSoundId(v)
 	if v == nil or v == "" then return "" end
 	if typeof(v) == "number" then return "rbxassetid://" .. v end
 	local s = tostring(v)
 	if s:match("^rbxassetid://") then return s end
 	if s:match("^%d+$")           then return "rbxassetid://" .. s end
-	return s  -- e.g. "rbxasset://..." o URL completo lasciato com'e'
+	return s
 end
 
--- Risolve un Attribute suono con fallback a SHIP_SOUND_DEFAULTS[ship.Name][name].
 local function soundAttr(name)
 	local v = ship:GetAttribute(name)
 	if v == nil or v == "" then
@@ -127,11 +116,11 @@ local function soundAttr(name)
 end
 
 local CONFIG = {
-	Damage          = attr("Damage", 30),
-	MaxSpeed        = attr("MaxSpeed", 150),
+	Damage          = attr("Damage",      30),
+	MaxSpeed        = attr("MaxSpeed",    150),
 	ReloadSpeed     = attr("ReloadSpeed", 0.18),
-	CanHover        = attr("CanHover", false),
-	-- Suoni risolti via Attribute con fallback alla tabella di default
+	CanHover        = attr("CanHover",    false),
+	Faction         = attr("Faction",     "Republic"),
 	FireSound       = soundAttr("FireSound"),
 	GetInSound      = soundAttr("GetInSound"),
 	TurnOn          = soundAttr("TurnOn"),
@@ -140,11 +129,16 @@ local CONFIG = {
 	HyperdriveSound = soundAttr("HyperdriveSound"),
 }
 
--- Aggiorna live se uno modifica gli attributi in Studio
-ship:GetAttributeChangedSignal("Damage"):Connect(function()      CONFIG.Damage      = attr("Damage", 30)       end)
-ship:GetAttributeChangedSignal("MaxSpeed"):Connect(function()    CONFIG.MaxSpeed    = attr("MaxSpeed", 150)    end)
+print(("[DBG] CONFIG: Faction=%s Damage=%s MaxSpeed=%s ReloadSpeed=%s"):format(
+	tostring(CONFIG.Faction), tostring(CONFIG.Damage),
+	tostring(CONFIG.MaxSpeed), tostring(CONFIG.ReloadSpeed)
+))
+
+ship:GetAttributeChangedSignal("Damage"):Connect(function()      CONFIG.Damage      = attr("Damage", 30)        end)
+ship:GetAttributeChangedSignal("MaxSpeed"):Connect(function()    CONFIG.MaxSpeed    = attr("MaxSpeed", 150)     end)
 ship:GetAttributeChangedSignal("ReloadSpeed"):Connect(function() CONFIG.ReloadSpeed = attr("ReloadSpeed", 0.18) end)
-ship:GetAttributeChangedSignal("CanHover"):Connect(function()    CONFIG.CanHover    = attr("CanHover", false)  end)
+ship:GetAttributeChangedSignal("CanHover"):Connect(function()    CONFIG.CanHover    = attr("CanHover", false)   end)
+ship:GetAttributeChangedSignal("Faction"):Connect(function()     CONFIG.Faction     = attr("Faction", "Republic") end)
 
 local function bindSoundAttr(attrName, target)
 	ship:GetAttributeChangedSignal(attrName):Connect(function()
@@ -162,8 +156,12 @@ bindSoundAttr("HyperdriveSound", function() return hyperdriveSound end)
 -- ============================================================================
 -- RESOLVE PARTS
 -- ============================================================================
+print("[DBG] Cerco VehicleSeat...")
 local vehicleSeat = ship:FindFirstChildWhichIsA("VehicleSeat", true)
-assert(vehicleSeat, ("[ShipScript] %s: VehicleSeat mancante."):format(ship.Name))
+if not vehicleSeat then
+	error("[DBG] ERRORE FATALE: VehicleSeat non trovato in " .. ship:GetFullName())
+end
+print("[DBG] VehicleSeat:", vehicleSeat:GetFullName())
 
 local cameraPart = ship:FindFirstChild("CameraPart", true)
 local zoomPart   = ship:FindFirstChild("ZoomPart",   true)
@@ -172,8 +170,13 @@ local rightWing  = ship:FindFirstChild("RightWing",     true)
 local openLeft   = ship:FindFirstChild("OpenLeftWing",  true)
 local openRight  = ship:FindFirstChild("OpenRightWing", true)
 
--- Cannoni: auto-detect di Laser1, Laser2, Laser3, ... fino al primo gap.
--- Funziona per qualunque numero di cannoni (2 per ARC-170, 4 per X-Wing, ecc.).
+print(("[DBG] CameraPart=%s ZoomPart=%s LeftWing=%s RightWing=%s OpenLeft=%s OpenRight=%s"):format(
+	tostring(cameraPart~=nil), tostring(zoomPart~=nil),
+	tostring(leftWing~=nil),   tostring(rightWing~=nil),
+	tostring(openLeft~=nil),   tostring(openRight~=nil)
+))
+
+-- Cannoni: auto-detect Laser1, Laser2, Laser3, ...
 local cannons = {}
 do
 	local i = 1
@@ -185,17 +188,24 @@ do
 	end
 end
 local cannonIndex = 0
+print("[DBG] Cannoni trovati:", #cannons)
 
 if not ship.PrimaryPart then
+	print("[DBG] PrimaryPart non impostato, uso VehicleSeat o primo BasePart")
 	ship.PrimaryPart = (vehicleSeat:IsA("BasePart") and vehicleSeat)
 		or ship:FindFirstChildWhichIsA("BasePart")
 end
 local primary = ship.PrimaryPart
-assert(primary, ("[ShipScript] %s: PrimaryPart impossibile da determinare."):format(ship.Name))
+if not primary then
+	error("[DBG] ERRORE FATALE: PrimaryPart impossibile da determinare in " .. ship:GetFullName())
+end
+print("[DBG] PrimaryPart:", primary:GetFullName())
 
 -- ============================================================================
 -- WELD MODEL
 -- ============================================================================
+print("[DBG] Avvio weld...")
+local weldCount = 0
 local function ensureWeldedTo(root)
 	root.Anchored = true
 	for _, p in ipairs(ship:GetDescendants()) do
@@ -205,29 +215,28 @@ local function ensureWeldedTo(root)
 				w.Part0  = root
 				w.Part1  = p
 				w.Parent = p
+				weldCount = weldCount + 1
 			end
 			p.Anchored = false
 		end
 	end
 end
 ensureWeldedTo(primary)
-
--- Inizio: nave ferma (anchored). Diventa unanchored solo quando un pilota sale.
+print("[DBG] Weld OK:", weldCount, "vincoli creati")
 primary.Anchored = true
 
 -- ============================================================================
 -- VEHICLE SEAT TUNING
 -- ============================================================================
-vehicleSeat.MaxSpeed        = CONFIG.MaxSpeed
-vehicleSeat.TurnSpeed       = 0.4
-vehicleSeat.Torque          = 10
-vehicleSeat.HeadsUpDisplay  = false  -- niente cerchio "Hold E" di default
--- Disabilitiamo la guida nativa del VehicleSeat: il client gestisce la fisica
--- via ShipGyro/ShipVelocity. Il giocatore puo' comunque sedersi.
-vehicleSeat.Disabled        = true
+vehicleSeat.MaxSpeed       = CONFIG.MaxSpeed
+vehicleSeat.TurnSpeed      = 0.4
+vehicleSeat.Torque         = 10
+vehicleSeat.HeadsUpDisplay = false
+vehicleSeat.Disabled       = true
+print("[DBG] VehicleSeat configurato, Disabled=true")
 
 -- ============================================================================
--- BODY MOVERS  (creati una volta, manipolati dal client durante il volo)
+-- BODY MOVERS
 -- ============================================================================
 local function ensureMover(name, class, setup)
 	local m = primary:FindFirstChild(name)
@@ -243,17 +252,15 @@ end
 
 local shipGyro = ensureMover("ShipGyro", "BodyGyro", function(g)
 	g.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-	-- P piu' basso e D piu' alto = movimento meno snappy, piu' fluido.
-	-- Combinato col CFrame:Lerp del setpoint sul client da' una sterzata morbida.
 	g.P         = 1800
 	g.D         = 900
 	g.CFrame    = primary.CFrame
 end)
-
 local shipVelocity = ensureMover("ShipVelocity", "BodyVelocity", function(v)
-	v.MaxForce = Vector3.new(0, 0, 0) -- spento finche' nessuno pilota
+	v.MaxForce = Vector3.new(0, 0, 0)
 	v.Velocity = Vector3.zero
 end)
+print("[DBG] BodyGyro + BodyVelocity creati")
 
 -- ============================================================================
 -- WINGS
@@ -266,69 +273,151 @@ local function setGroupTransparency(group, t)
 	end
 end
 
--- attackPosition = true  -> ali APERTE in X (cruise/combat)
--- attackPosition = false -> ali CHIUSE parallele (hyperdrive/travel/stowed)
-local function updateWings(attackPosition)
-	setGroupTransparency(leftWing,  attackPosition and 1 or 0)  -- chiuse visibili quando NON attack
-	setGroupTransparency(rightWing, attackPosition and 1 or 0)
-	setGroupTransparency(openLeft,  attackPosition and 0 or 1)  -- aperte visibili quando attack
-	setGroupTransparency(openRight, attackPosition and 0 or 1)
+-- Wingtip trails: Trail/ParticleEmitter dentro OpenLeftWing/OpenRightWing.
+-- ON in Combat (sfoils aperte), OFF in Hangar.
+local wingtipTrails = {}
+local function collectWingtipTrails()
+	for _, group in ipairs({ openLeft, openRight }) do
+		if group then
+			for _, d in ipairs(group:GetDescendants()) do
+				if d:IsA("Trail") or d:IsA("ParticleEmitter") then
+					table.insert(wingtipTrails, d)
+				end
+			end
+		end
+	end
 end
-updateWings(false)  -- stato iniziale: parcheggio (ali chiuse)
+collectWingtipTrails()
+print("[DBG] Wingtip trails:", #wingtipTrails)
+
+local function setWingtipTrails(on)
+	for _, t in ipairs(wingtipTrails) do t.Enabled = on end
+end
+
+-- open=true  -> ali aperte (Combat): OpenLeft/Right visibili, Left/Right nascosti
+-- open=false -> ali chiuse (Hangar): Left/Right visibili, OpenLeft/Right nascosti
+local function updateWings(open)
+	setGroupTransparency(leftWing,  open and 1 or 0)
+	setGroupTransparency(rightWing, open and 1 or 0)
+	setGroupTransparency(openLeft,  open and 0 or 1)
+	setGroupTransparency(openRight, open and 0 or 1)
+	setWingtipTrails(open)
+end
+updateWings(false)  -- default: Hangar (ali chiuse)
 
 -- ============================================================================
--- ENGINE TRAIL
--- Cerchiamo nel modello ogni BasePart il cui nome inizia con "Engine"
--- (es. Engine, Engine1, EngineLeft) e ci attacchiamo un Trail visibile solo
--- a motore acceso. Se non ne trovi, il sistema resta silente.
+-- SFOIL TRAILS  (Part "TrailPart" nel modello, opzionali)
+-- ============================================================================
+local sfoilTrails = {}
+local SFOIL_TRAIL_SPAN_FRAC = 0.45
+local SFOIL_TRAIL_LIFETIME  = 0.45
+local SFOIL_TRAIL_WIDTH     = 0.6
+local SFOIL_TRAIL_FACECAM   = true
+
+local function buildSfoilTrail(part)
+	local sz  = part.Size
+	local at0 = part:FindFirstChild("SfoilTrailA0")
+	if not at0 then
+		at0 = Instance.new("Attachment")
+		at0.Name   = "SfoilTrailA0"
+		at0.Parent = part
+	end
+	at0.Position = Vector3.new(0,  sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
+	local at1 = part:FindFirstChild("SfoilTrailA1")
+	if not at1 then
+		at1 = Instance.new("Attachment")
+		at1.Name   = "SfoilTrailA1"
+		at1.Parent = part
+	end
+	at1.Position = Vector3.new(0, -sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
+	local trail = part:FindFirstChild("SfoilTrail")
+	if not trail or not trail:IsA("Trail") then
+		if trail then trail:Destroy() end
+		trail        = Instance.new("Trail")
+		trail.Name   = "SfoilTrail"
+		trail.Parent = part
+	end
+	trail.Attachment0 = at0
+	trail.Attachment1 = at1
+	trail.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+		ColorSequenceKeypoint.new(0.6, Color3.fromRGB(220, 240, 255)),
+		ColorSequenceKeypoint.new(1,   Color3.fromRGB(150, 200, 255)),
+	})
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0,    0.05),
+		NumberSequenceKeypoint.new(0.35, 0.4),
+		NumberSequenceKeypoint.new(1,    1),
+	})
+	trail.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, SFOIL_TRAIL_WIDTH),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	trail.Lifetime       = SFOIL_TRAIL_LIFETIME
+	trail.MinLength      = 0
+	trail.MaxLength      = 0
+	trail.LightEmission  = 1
+	trail.LightInfluence = 0
+	trail.FaceCamera     = SFOIL_TRAIL_FACECAM
+	trail.Enabled        = false
+	return trail
+end
+
+for _, d in ipairs(ship:GetDescendants()) do
+	if d:IsA("BasePart") and d.Name == "TrailPart" then
+		table.insert(sfoilTrails, buildSfoilTrail(d))
+	end
+end
+local function setSfoilTrails(enabled)
+	for _, t in ipairs(sfoilTrails) do t.Enabled = enabled end
+end
+print("[DBG] SfoilTrails (TrailPart):", #sfoilTrails)
+
+-- ============================================================================
+-- ENGINE TRAIL  (Part "Engine*" nel modello)
 -- ============================================================================
 local engineTrails = {}
-
 local function isEnginePart(p)
 	if not p:IsA("BasePart") then return false end
 	local n = p.Name
 	return n == "Engine" or n:match("^Engine") ~= nil
 end
-
 local function buildEngineTrail(part)
-	-- 2 attachments verticali sul retro della part (back face: local +Z)
 	local sz = part.Size
 	local at0 = part:FindFirstChild("EngineTrailA0")
 	if not at0 then
 		at0 = Instance.new("Attachment")
-		at0.Name     = "EngineTrailA0"
-		at0.Parent   = part
+		at0.Name   = "EngineTrailA0"
+		at0.Parent = part
 	end
-	at0.Position = Vector3.new(0,  sz.Y / 2 * 0.7, sz.Z / 2)
-
+	at0.Position = Vector3.new(0, sz.Y / 2 * 0.7, sz.Z / 2)
 	local at1 = part:FindFirstChild("EngineTrailA1")
 	if not at1 then
 		at1 = Instance.new("Attachment")
-		at1.Name     = "EngineTrailA1"
-		at1.Parent   = part
+		at1.Name   = "EngineTrailA1"
+		at1.Parent = part
 	end
 	at1.Position = Vector3.new(0, -sz.Y / 2 * 0.7, sz.Z / 2)
-
 	local trail = part:FindFirstChild("EngineTrail")
 	if not trail or not trail:IsA("Trail") then
 		if trail then trail:Destroy() end
-		trail        = Instance.new("Trail")
-		trail.Name   = "EngineTrail"
+		trail      = Instance.new("Trail")
+		trail.Name = "EngineTrail"
 		trail.Parent = part
 	end
-	trail.Attachment0    = at0
-	trail.Attachment1    = at1
-	trail.Color          = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, Color3.fromRGB(170, 235, 255)),
-		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(80, 160, 255)),
-		ColorSequenceKeypoint.new(1, Color3.fromRGB(30,  60, 180)),
+	trail.Attachment0 = at0
+	trail.Attachment1 = at1
+	trail.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0,   Color3.fromRGB(170, 235, 255)),
+		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(80,  160, 255)),
+		ColorSequenceKeypoint.new(1,   Color3.fromRGB(30,   60, 180)),
 	})
-	trail.Transparency   = NumberSequence.new({
+	trail.Transparency = NumberSequence.new({
 		NumberSequenceKeypoint.new(0,   0.05),
 		NumberSequenceKeypoint.new(0.6, 0.45),
 		NumberSequenceKeypoint.new(1,   1),
 	})
-	trail.WidthScale     = NumberSequence.new({
+	trail.WidthScale = NumberSequence.new({
 		NumberSequenceKeypoint.new(0, 1),
 		NumberSequenceKeypoint.new(1, 0),
 	})
@@ -341,103 +430,19 @@ local function buildEngineTrail(part)
 	trail.Enabled        = false
 	return trail
 end
-
 for _, d in ipairs(ship:GetDescendants()) do
 	if isEnginePart(d) then
 		table.insert(engineTrails, buildEngineTrail(d))
 	end
 end
-
--- ============================================================================
--- SFOIL TRAILS  (Part chiamate "TrailPart" nel modello)
--- Si accendono quando si APRONO le S-foils (esci da cruise). In cruise restano
--- spente. Tipico effetto X-wing / ARC-170 quando si va in full throttle.
--- ============================================================================
-local sfoilTrails = {}
-
--- Tuning del trail stile film: scia bianca sottile e breve, molto luminosa.
--- Se non ti torna, regola questi numeri in cima alla funzione.
-local SFOIL_TRAIL_SPAN_FRAC = 0.45  -- distanza tra i due Attachment (0..1 della Y della part). Piu' alto = scia piu' "spessa"
-local SFOIL_TRAIL_LIFETIME  = 0.45  -- durata della scia (s). Piu' alto = scia piu' lunga
-local SFOIL_TRAIL_WIDTH     = 0.6   -- WidthScale di partenza
-local SFOIL_TRAIL_FACECAM   = true  -- guarda sempre la camera (look "movie")
-
-local function buildSfoilTrail(part)
-	local sz  = part.Size
-	local at0 = part:FindFirstChild("SfoilTrailA0")
-	if not at0 then
-		at0 = Instance.new("Attachment")
-		at0.Name   = "SfoilTrailA0"
-		at0.Parent = part
-	end
-	at0.Position = Vector3.new(0,  sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
-
-	local at1 = part:FindFirstChild("SfoilTrailA1")
-	if not at1 then
-		at1 = Instance.new("Attachment")
-		at1.Name   = "SfoilTrailA1"
-		at1.Parent = part
-	end
-	at1.Position = Vector3.new(0, -sz.Y / 2 * SFOIL_TRAIL_SPAN_FRAC, sz.Z / 2)
-
-	local trail = part:FindFirstChild("SfoilTrail")
-	if not trail or not trail:IsA("Trail") then
-		if trail then trail:Destroy() end
-		trail        = Instance.new("Trail")
-		trail.Name   = "SfoilTrail"
-		trail.Parent = part
-	end
-	trail.Attachment0 = at0
-	trail.Attachment1 = at1
-
-	-- Colore: pure white core con velo cyan tenue verso la coda
-	trail.Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
-		ColorSequenceKeypoint.new(0.6, Color3.fromRGB(220, 240, 255)),
-		ColorSequenceKeypoint.new(1,   Color3.fromRGB(150, 200, 255)),
-	})
-
-	-- Transparency: parte quasi opaca, sfuma rapidamente a invisibile
-	trail.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0,    0.05),
-		NumberSequenceKeypoint.new(0.35, 0.4),
-		NumberSequenceKeypoint.new(1,    1),
-	})
-
-	-- WidthScale: triangolare, parte sottile e finisce a punta
-	trail.WidthScale = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, SFOIL_TRAIL_WIDTH),
-		NumberSequenceKeypoint.new(1, 0),
-	})
-
-	trail.Lifetime       = SFOIL_TRAIL_LIFETIME
-	trail.MinLength      = 0
-	trail.MaxLength      = 0
-	trail.LightEmission  = 1            -- pieno glow (richiesto per il look "cinema")
-	trail.LightInfluence = 0
-	trail.FaceCamera     = SFOIL_TRAIL_FACECAM
-	trail.Enabled        = false
-	return trail
-end
-
-for _, d in ipairs(ship:GetDescendants()) do
-	if d:IsA("BasePart") and d.Name == "TrailPart" then
-		table.insert(sfoilTrails, buildSfoilTrail(d))
-	end
-end
-
-local function setSfoilTrails(enabled)
-	for _, t in ipairs(sfoilTrails) do
-		t.Enabled = enabled
-	end
-end
+print("[DBG] Engine trails:", #engineTrails)
 
 -- ============================================================================
 -- ENGINE STATE
 -- ============================================================================
 local engineOn = false
-
 local function setEngine(on)
+	print("[DBG] setEngine:", on, "(era:", engineOn, ")")
 	if engineOn == on then return end
 	engineOn = on
 	if on then
@@ -447,28 +452,26 @@ local function setEngine(on)
 		shipVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 		shipVelocity.Velocity = Vector3.zero
 		for _, t in ipairs(engineTrails) do t.Enabled = true end
-		-- Audio: TurnOn one-shot + ShipSound looped ambient
 		playOneShot(turnOnSound)
 		if shipSound and shipSound.SoundId ~= "" and not shipSound.IsPlaying then
 			shipSound:Play()
 		end
+		print("[DBG] Motore ACCESO")
 	else
 		shipVelocity.Velocity = Vector3.zero
 		shipVelocity.MaxForce = Vector3.new(0, 0, 0)
 		shipGyro.MaxTorque    = Vector3.new(0, 0, 0)
 		primary.Anchored      = true
 		for _, t in ipairs(engineTrails) do t.Enabled = false end
-		-- Audio: stop ambient + TurnOff one-shot
 		if shipSound and shipSound.IsPlaying then shipSound:Stop() end
 		playOneShot(turnOffSound)
+		print("[DBG] Motore SPENTO")
 	end
 end
 
 -- ============================================================================
 -- SOUNDS
 -- ============================================================================
--- Tutti i suoni 3D sono parentati al primary (posizionali, attenuano con la
--- distanza). Riusiamo Sound child esistenti se gia' presenti col giusto nome.
 local function makeSound(name, soundId, opts)
 	opts = opts or {}
 	local s = primary:FindFirstChild(name)
@@ -478,12 +481,12 @@ local function makeSound(name, soundId, opts)
 		s.Name   = name
 		s.Parent = primary
 	end
-	s.SoundId          = soundId or ""
-	s.Volume           = opts.Volume or 1
-	s.Looped           = opts.Looped or false
-	s.RollOffMode      = opts.RollOffMode or Enum.RollOffMode.InverseTapered
-	s.RollOffMinDistance = opts.MinDist or 10
-	s.RollOffMaxDistance = opts.MaxDist or 250
+	s.SoundId              = soundId or ""
+	s.Volume               = opts.Volume or 1
+	s.Looped               = opts.Looped or false
+	s.RollOffMode          = opts.RollOffMode or Enum.RollOffMode.InverseTapered
+	s.RollOffMinDistance   = opts.MinDist or 10
+	s.RollOffMaxDistance   = opts.MaxDist or 250
 	return s
 end
 
@@ -492,10 +495,14 @@ getInSound      = makeSound("GetInSound",      CONFIG.GetInSound,      { Volume 
 turnOnSound     = makeSound("TurnOn",          CONFIG.TurnOn,          { Volume = 1 })
 turnOffSound    = makeSound("TurnOff",         CONFIG.TurnOff,         { Volume = 1 })
 shipSound       = makeSound("ShipSound",       CONFIG.ShipSound,       { Volume = 0.6, Looped = true, MaxDist = 400 })
-hyperdriveSound = makeSound("HyperdriveSound", CONFIG.HyperdriveSound, { Volume = 1, MaxDist = 350 })
+hyperdriveSound = makeSound("HyperdriveSound", CONFIG.HyperdriveSound, { Volume = 1,   MaxDist = 350 })
 
--- Assegna alla forward declaration in alto (NON usare 'local function' qui
--- altrimenti shadowiamo).
+print(("[DBG] Suoni: FireSound=%s TurnOn=%s GetInSound=%s ShipSound=%s"):format(
+	tostring(fireSound.SoundId ~= ""), tostring(turnOnSound.SoundId ~= ""),
+	tostring(getInSound.SoundId ~= ""), tostring(shipSound.SoundId ~= "")
+))
+
+-- Definisce playOneShot (usata da setEngine sopra tramite forward decl.)
 playOneShot = function(s)
 	if s and s.SoundId ~= "" then
 		s.TimePosition = 0
@@ -504,12 +511,15 @@ playOneShot = function(s)
 end
 
 -- ============================================================================
--- ENTRY: solo via ProximityPrompt
+-- ENTRY: ProximityPrompt
 -- ============================================================================
 local prompt = vehicleSeat:FindFirstChildOfClass("ProximityPrompt")
 if not prompt then
 	prompt = Instance.new("ProximityPrompt")
 	prompt.Parent = vehicleSeat
+	print("[DBG] ProximityPrompt creato")
+else
+	print("[DBG] ProximityPrompt esistente trovato")
 end
 prompt.ActionText            = "Pilot"
 prompt.ObjectText            = ship.Name
@@ -522,86 +532,77 @@ prompt.Enabled               = true
 local entryArmed = false
 
 prompt.Triggered:Connect(function(player)
+	print("[DBG] Prompt triggerato da:", player.Name, "| Occupant:", tostring(vehicleSeat.Occupant))
 	if vehicleSeat.Occupant then return end
 	local char = player.Character
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
-	if not hum then return end
+	if not hum then warn("[DBG] Humanoid non trovato per", player.Name); return end
 	entryArmed = true
 	vehicleSeat:Sit(hum)
+	print("[DBG] :Sit() chiamato per", player.Name)
 	task.delay(0.5, function() entryArmed = false end)
 end)
 
 -- ============================================================================
--- OCCUPANT CHANGE: gestisce anchored, body movers, ali, network ownership
+-- OCCUPANT CHANGE
 -- ============================================================================
 local function onEnter()
-	-- Restituiamo l'ownership al pilota cosi' il volo client-side e' fluido.
 	local occupant = vehicleSeat.Occupant
 	local player   = occupant and game:GetService("Players"):GetPlayerFromCharacter(occupant.Parent)
+	print("[DBG] onEnter: player =", tostring(player and player.Name))
 	if player then
-		pcall(function() primary:SetNetworkOwner(player) end)
+		local ok, err = pcall(function() primary:SetNetworkOwner(player) end)
+		if not ok then warn("[DBG] SetNetworkOwner fallito:", err) end
 	end
-	-- Motore spento all'ingresso: la nave resta ferma finche' il pilota non
-	-- preme R (gestito dal client tramite ShipEvent "EngineToggle").
 	setEngine(false)
-	-- Cabina pilotata: posizione di combattimento (ali APERTE in X), niente trails
-	updateWings(true)
+	-- Avvio in Hangar: ali CHIUSE
+	updateWings(false)
 	setSfoilTrails(false)
-	-- Audio: suono di ingresso pilota
 	playOneShot(getInSound)
 	prompt.Enabled = false
+	print("[DBG] Ingresso completato")
 end
 
 local function onExit()
-	setEngine(false)            -- spegne anche shipSound + suona TurnOff
+	print("[DBG] onExit")
+	setEngine(false)
 	pcall(function() primary:SetNetworkOwner(nil) end)
-	-- Parcheggio: ali chiuse, no trails
 	updateWings(false)
 	setSfoilTrails(false)
-	-- Hyperdrive si annulla all'uscita (visualmente gia' chiuso, qui solo flag)
-	hyperdriveActive = false
 	prompt.Enabled = true
+	print("[DBG] Uscita completata")
 end
 
 vehicleSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
 	local occupant = vehicleSeat.Occupant
+	print("[DBG] Occupant cambiato:", tostring(occupant), "| entryArmed:", entryArmed)
 	if occupant and not entryArmed then
-		-- Qualcuno ha "toccato" il sedile senza usare il prompt: lo cacciamo.
+		warn("[DBG] Seduta senza prompt! Espello.")
 		local hrp = occupant.Parent and occupant.Parent:FindFirstChild("HumanoidRootPart")
 		vehicleSeat:Sit(nil)
 		if hrp then hrp.CFrame = hrp.CFrame + Vector3.new(0, 4, 0) end
 		return
 	end
-	if occupant then
-		onEnter()
-	else
-		onExit()
-	end
+	if occupant then onEnter() else onExit() end
 end)
 
 -- ============================================================================
 -- SHIP HEALTH / SHIELDS
 -- ============================================================================
--- Stato di vita della nave, replicato al client tramite Attributi:
---   MaxHealth, MaxShields            -> tetto (lettura)
---   CurrentHealth, CurrentShields    -> stato vivo (server scrive, client legge)
--- Tuning live: modificabile da Studio come Attributes del Model.
 local MAX_HEALTH         = attr("MaxHealth",        100)
 local MAX_SHIELDS        = attr("MaxShields",       100)
-local SHIELD_REGEN_DELAY = attr("ShieldRegenDelay", 4)   -- s dopo l'ultimo hit
-local SHIELD_REGEN_RATE  = attr("ShieldRegenRate",  20)  -- punti/s
+local SHIELD_REGEN_DELAY = attr("ShieldRegenDelay", 4)
+local SHIELD_REGEN_RATE  = attr("ShieldRegenRate",  20)
 
 ship:SetAttribute("MaxHealth",      MAX_HEALTH)
 ship:SetAttribute("MaxShields",     MAX_SHIELDS)
 ship:SetAttribute("CurrentHealth",  MAX_HEALTH)
 ship:SetAttribute("CurrentShields", MAX_SHIELDS)
 
-local lastHitClock = -math.huge
+local lastHitClock    = -math.huge
 local lastShieldsSeen = MAX_SHIELDS
 local lastHealthSeen  = MAX_HEALTH
 
--- Quando un'altra nave/colpo riduce i nostri scudi o scafo via Attribute,
--- consideriamo il momento come "ultimo hit" -> blocca regen per SHIELD_REGEN_DELAY.
 ship:GetAttributeChangedSignal("CurrentShields"):Connect(function()
 	local v = ship:GetAttribute("CurrentShields") or 0
 	if v < lastShieldsSeen then lastHitClock = os.clock() end
@@ -611,19 +612,13 @@ ship:GetAttributeChangedSignal("CurrentHealth"):Connect(function()
 	local v = ship:GetAttribute("CurrentHealth") or 0
 	if v < lastHealthSeen then lastHitClock = os.clock() end
 	lastHealthSeen = v
-	if v <= 0 then
-		-- TODO: morte/esplosione nave. Per ora la nave resta, da implementare.
-		-- (lasciamo i scudi/HP a 0 finche' non si rigenerano dopo il delay).
-	end
 end)
 
--- Regen scudi: se da SHIELD_REGEN_DELAY non c'e' stato un hit, ricarica.
 task.spawn(function()
 	while ship.Parent do
 		task.wait(0.25)
-		local now = os.clock()
-		if now - lastHitClock >= SHIELD_REGEN_DELAY then
-			local s = ship:GetAttribute("CurrentShields") or 0
+		if os.clock() - lastHitClock >= SHIELD_REGEN_DELAY then
+			local s    = ship:GetAttribute("CurrentShields") or 0
 			local maxS = ship:GetAttribute("MaxShields") or MAX_SHIELDS
 			if s < maxS then
 				ship:SetAttribute("CurrentShields", math.min(maxS, s + SHIELD_REGEN_RATE * 0.25))
@@ -632,29 +627,26 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================================
--- SHOOTING
--- ============================================================================
-local LASER_SPEED         = 750
-local LASER_LIFETIME      = 5
-local lastShot            = 0
-local BULLETS_FOLDER_NAME = "ShipBullets"
+print("[DBG] ========== ShipScript inizializzazione COMPLETATA:", ship.Name, "==========")
 
--- Stato hyperdrive: quando true, ali chiuse + trails + alta velocita' + ARMI OFF.
-local hyperdriveActive = false
+-- ============================================================================
+-- SHOOTING  (raycast, come 663b986)
+-- ============================================================================
+local LASER_SPEED    = 750
+local LASER_LIFETIME = 5
+local lastShot       = 0
+local BULLETS_FOLDER_NAME = "ShipBullets"
 
 local function getBulletsFolder()
 	local f = Workspace:FindFirstChild(BULLETS_FOLDER_NAME)
 	if not f then
-		f        = Instance.new("Folder")
+		f = Instance.new("Folder")
 		f.Name   = BULLETS_FOLDER_NAME
 		f.Parent = Workspace
 	end
 	return f
 end
 
--- Risale dalla part colpita al Model "nave" (cerca un VehicleSeat tra i
--- discendenti). Se trovato e diverso da noi, applichiamo danno alla nave.
 local function findShipModelFrom(hitInstance)
 	local m = hitInstance:FindFirstAncestorOfClass("Model")
 	while m do
@@ -665,12 +657,11 @@ local function findShipModelFrom(hitInstance)
 end
 
 local function spawnLaser(originPos, direction)
-	-- Lazy-resolve template se aggiunto dopo l'avvio
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
 		laserTemplate = resolveLaserTemplate()
 	end
 	if not laserTemplate or not laserTemplate:IsA("BasePart") then
-		warn(("[ShipScript] %s: LaserBolt non trovato (FlightEvents.%s.LaserBolt)."):format(ship.Name, ship.Name))
+		warn("[ShipScript] LaserBolt non trovato.")
 		return
 	end
 	if direction.Magnitude < 1e-3 or direction.X ~= direction.X then return end
@@ -694,15 +685,24 @@ local function spawnLaser(originPos, direction)
 		local lastTime  = startTime
 
 		while laser.Parent and (os.clock() - startTime) < LASER_LIFETIME do
-			local now = os.clock()
-			local dt  = now - lastTime
-			lastTime  = now
-
+			local now  = os.clock()
+			local dt   = now - lastTime
+			lastTime   = now
 			local step = direction * LASER_SPEED * dt
-			local hit  = workspace:Raycast(laser.Position, step, rayParams)
+			local hit  = Workspace:Raycast(laser.Position, step, rayParams)
+
 			if hit then
 				laser.CFrame = CFrame.lookAt(hit.Position, hit.Position + direction)
-				-- 1) Nave colpita: danno a scudi -> scafo via Attributes.
+
+				-- Fuoco amico: salta modelli della stessa fazione
+				local hitModel = hit.Instance:FindFirstAncestorOfClass("Model")
+				if hitModel and hitModel:GetAttribute("Faction") == CONFIG.Faction then
+					-- Passthrough (non distruggiamo il laser qui, usciremo dal loop)
+					laser:Destroy()
+					return
+				end
+
+				-- Danno a nave (scudi -> scafo)
 				local hitShip = findShipModelFrom(hit.Instance)
 				if hitShip and hitShip ~= ship then
 					local s    = hitShip:GetAttribute("CurrentShields") or 0
@@ -717,22 +717,24 @@ local function spawnLaser(originPos, direction)
 						hitShip:SetAttribute("CurrentHealth", math.max(0, h - left))
 					end
 				else
-					-- 2) Player a piedi (Humanoid)
+					-- Danno a player a piedi (Humanoid)
 					local model = hit.Instance:FindFirstAncestorOfClass("Model")
-					local hum   = model and model:FindFirstChildOfClass("Humanoid")
-					if hum and hum.Health > 0 then
-						hum:TakeDamage(CONFIG.Damage)
+					if model and model:GetAttribute("Faction") ~= CONFIG.Faction then
+						local hum = model:FindFirstChildOfClass("Humanoid")
+						if hum and hum.Health > 0 then
+							hum:TakeDamage(CONFIG.Damage)
+						end
 					end
 				end
 
-				-- Effetto cinematografico al punto d'impatto (visuale, niente forza)
+				-- Flash d'impatto
 				local exp = Instance.new("Explosion")
-				exp.Position                   = hit.Position
-				exp.BlastRadius                = 0
-				exp.BlastPressure              = 0
-				exp.DestroyJointRadiusPercent  = 0
-				exp.Visible                    = true
-				exp.Parent                     = Workspace
+				exp.Position                  = hit.Position
+				exp.BlastRadius               = 0
+				exp.BlastPressure             = 0
+				exp.DestroyJointRadiusPercent = 0
+				exp.Visible                   = true
+				exp.Parent                    = Workspace
 				break
 			end
 
@@ -744,68 +746,72 @@ local function spawnLaser(originPos, direction)
 	end)
 end
 
+-- ============================================================================
+-- SHIPEV ENT HANDLER
+-- ============================================================================
 ShipEvent.OnServerEvent:Connect(function(player, action, data)
-	if typeof(data) ~= "table" then return end
-	if vehicleSeat.Occupant == nil then return end
-	local pilotChar = vehicleSeat.Occupant.Parent
-	if pilotChar ~= player.Character then return end -- non sta pilotando questa nave
+	print("[DBG] ShipEvent:", action, "da", player.Name)
+	if typeof(data) ~= "table" then
+		warn("[DBG] data non e' table:", typeof(data)); return
+	end
+	if vehicleSeat.Occupant == nil then
+		warn("[DBG] Nessun Occupant, ignoro"); return
+	end
+	if vehicleSeat.Occupant.Parent ~= player.Character then
+		warn("[DBG] Player non pilota questa nave"); return
+	end
 
 	if action == "Shoot" then
-		if typeof(data.Direction) ~= "Vector3" then return end
-		-- Armi DISABILITATE in hyperdrive (ali chiuse, modalita' travel).
-		if hyperdriveActive then return end
-
 		local now = os.clock()
 		if now - lastShot < CONFIG.ReloadSpeed then return end
 		lastShot = now
 
-		local dir = data.Direction.Unit
-		-- Quanti cannoni per colpo? Attribute CannonsPerShot:
-		--   0 (default) o >= #cannoni -> tutti simultanei (ARC-170 twin laser)
-		--   1                          -> uno alla volta, cicla
-		--   N (1 <= N < #cannoni)      -> N alla volta, batch ciclanti
+		-- Direzione per-cannone: usa Converge (gimbal) se disponibile, poi Direction, poi muso.
+		local function dirFrom(originPos)
+			if typeof(data.Converge) == "Vector3" then
+				local d = (data.Converge - originPos)
+				if d.Magnitude > 0.01 then return d.Unit end
+			end
+			if typeof(data.Direction) == "Vector3" then
+				return data.Direction.Unit
+			end
+			return primary.CFrame.LookVector
+		end
+
 		if #cannons > 0 then
 			local perShot = ship:GetAttribute("CannonsPerShot") or 0
 			if perShot <= 0 or perShot >= #cannons then
-				-- Volley: tutti i cannoni sparano insieme.
 				for _, c in ipairs(cannons) do
-					spawnLaser(c.Position, dir)
+					spawnLaser(c.Position, dirFrom(c.Position))
 				end
 			else
-				-- Batch ciclico di N cannoni.
 				for _ = 1, perShot do
 					cannonIndex = (cannonIndex % #cannons) + 1
-					spawnLaser(cannons[cannonIndex].Position, dir)
+					spawnLaser(cannons[cannonIndex].Position, dirFrom(cannons[cannonIndex].Position))
 				end
 			end
 		else
-			spawnLaser(primary.Position + primary.CFrame.LookVector * 8, dir)
+			local fb = primary.Position + primary.CFrame.LookVector * 8
+			spawnLaser(fb, dirFrom(fb))
 		end
-		if fireSound and fireSound.SoundId ~= "" then
-			fireSound:Play()
-		end
+		if fireSound and fireSound.SoundId ~= "" then fireSound:Play() end
 
 	elseif action == "ToggleSfoils" then
-		-- N (toggle s-foils) ora alterna ATTACK <-> HYPERDRIVE:
-		--   data.State = true  -> entra in hyperdrive (ali chiuse, trails, no armi)
-		--   data.State = false -> torna in attack (ali aperte X, armi)
-		local hyper = data.State == true
-		local wasHyper = hyperdriveActive
-		hyperdriveActive = hyper
-		updateWings(not hyper)
-		setSfoilTrails(hyper)
-		-- Audio: suona solo quando ENTRI in hyperdrive (not -> active)
-		if hyper and not wasHyper then
-			playOneShot(hyperdriveSound)
+		-- State=true  -> Combat  (ali aperte, trails ON)
+		-- State=false -> Hangar  (ali chiuse, trails OFF)
+		local combat = (data.State == true)
+		print("[DBG] ToggleSfoils: combat =", combat)
+		updateWings(combat)
+		setSfoilTrails(combat)
+		if combat then
+			playOneShot(hyperdriveSound)  -- suono "apertura ali"
 		end
 
 	elseif action == "EngineToggle" then
+		print("[DBG] EngineToggle:", data.State)
 		setEngine(data.State == true)
 
 	elseif action == "DrivePhysics" then
-		-- Il client invia setpoint per BodyGyro/BodyVelocity. Lavorando con
-		-- network ownership corretta questi sarebbero gia' replicati, ma
-		-- li sincronizziamo come backup per gli osservatori.
 		if typeof(data.CFrame) == "CFrame" then
 			shipGyro.CFrame = data.CFrame
 		end

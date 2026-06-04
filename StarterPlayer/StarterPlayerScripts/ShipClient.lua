@@ -1,15 +1,27 @@
 -- ShipClient.lua
 -- Posizione: StarterPlayer/StarterPlayerScripts/ShipClient
 --
--- Un singolo LocalScript che gestisce per qualsiasi nave:
---   - Controllo di volo (Cruise / Hover) e camera (CameraPart / ZoomPart)
---   - Apertura/chiusura ali (N)  e sparo (LMB)
---   - HUD "miracoloso" (reticle reattivo, throttle arc, altimetro,
---     reload bar, modulo info nave, scanline + vignetta)
+-- Controller di volo a DUE FASI per nave pesante (ARC-170).
 --
--- Una nave e' identificata come un Model che ha un VehicleSeat e una
--- CameraPart figlia. Tutta la config arriva dagli Attributes del Model:
---   Damage / MaxSpeed / FireSound / ReloadSpeed / CanHover
+--   FASE A - HANGAR / CRUISE  (stato di avvio di default)
+--     * Ali chiuse, trail wingtip OFF, armi DISABILITATE.
+--     * Velocita' massima bassa (HANGAR_SPEED) per manovrare in hangar.
+--     * W/S = accelera/frena lungo il muso. A/D = virata piatta (yaw).
+--     * Mouse NON sterza: camera orbita liberamente attorno alla nave (free look).
+--
+--   FASE B - COMBAT / THROTTLE  (premi N)
+--     * Ali aperte in X, trail wingtip ON, armi abilitate, velocita' piena.
+--     * Volo guidato dal mouse tramite crosshair virtuale su schermo.
+--     * Auto-banking proporzionale alla velocita' di virata.
+--     * Deriva inerziale: la velocita' insegue il muso (peso di un heavy fighter).
+--     * Camera bloccata dietro la nave; C attiva free-look orbitale.
+--     * Niente roll manuale (Q/E rimossi).
+--
+-- Lead indicator: proietta la posizione futura del bersaglio; il reticolo
+-- centrale diventa verde quando e' allineato al lead (colpo garantito).
+-- Convergenza: i raggi laser angolano verso il punto di convergenza;
+-- gimbal assist sposta il convergence point verso il lead quando il
+-- crosshair e' vicino ma non sopra.
 
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
@@ -17,6 +29,7 @@ local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
 local TweenService       = game:GetService("TweenService")
 local Workspace          = game:GetService("Workspace")
+local GuiService         = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
@@ -26,15 +39,51 @@ local camera      = Workspace.CurrentCamera
 local FlightEvents = ReplicatedStorage:WaitForChild("FlightEvents")
 local ShipEvent    = FlightEvents:WaitForChild("ShipEvent")
 
+-- Deve combaciare con LASER_SPEED in ShipScript per un lead corretto.
+local LASER_SPEED = 750
+
+-- ============================================================================
+-- COSTANTI DI VOLO
+-- ============================================================================
+local HANGAR_SPEED      = 20      -- studs/sec max in hangar
+local HANGAR_TURN_RATE  = 1.4     -- rad/sec yaw A/D in hangar
+local HANGAR_ACCEL      = 30      -- accel/brake rate in hangar
+
+local CROSSHAIR_MAX_R   = 300     -- pixel: deflessione massima crosshair
+local CROSSHAIR_SENS    = 1.0     -- moltiplicatore sensibilita' mouse
+local CROSSHAIR_RETURN  = 3.0     -- lambda ritorno al centro
+
+local YAW_RATE          = 2.1     -- rad/sec alla deflessione massima
+local PITCH_RATE        = 1.7
+local MAX_PITCH         = math.rad(80)
+
+local BANK_MAX          = math.rad(60)
+local BANK_LAMBDA       = 4
+local ROLL_RATE         = 2.2     -- rad/sec A/D in combat (dice roll)
+local AIM_LAMBDA        = 6
+local DRIFT_LAMBDA      = 2.4
+
+local TARGET_RANGE      = 1500
+local TARGET_CONE       = math.cos(math.rad(38))
+local ALIGN_TOL_PX      = 26
+local GIMBAL_TOL_PX     = 70
+local DEFAULT_CONV_DIST = 800
+local CANDIDATE_REFRESH = 0.35
+
+local FLIGHT_CHASE_BACK = 22
+local FLIGHT_CHASE_UP   = 7
+local MIN_CHASE, MAX_CHASE = -10, 80
+local MIN_HOVER, MAX_HOVER = 12, 70
+
 -- ============================================================================
 -- COLORS / VISUAL TOKENS
 -- ============================================================================
 local PALETTE = {
 	bg          = Color3.fromRGB(8, 12, 18),
 	panel       = Color3.fromRGB(14, 22, 30),
-	primary     = Color3.fromRGB(124, 220, 255),   -- cyan
+	primary     = Color3.fromRGB(124, 220, 255),
 	primaryDim  = Color3.fromRGB(52, 110, 138),
-	accent      = Color3.fromRGB(255, 200, 87),    -- amber
+	accent      = Color3.fromRGB(255, 200, 87),
 	danger      = Color3.fromRGB(255, 78, 78),
 	good        = Color3.fromRGB(94, 240, 160),
 	text        = Color3.fromRGB(230, 244, 255),
@@ -74,14 +123,13 @@ end
 
 local function gradient(parent, color, transparency, rotation)
 	return new("UIGradient", {
-		Parent   = parent,
-		Color    = color,
+		Parent       = parent,
+		Color        = color,
 		Transparency = transparency or NumberSequence.new(0),
-		Rotation = rotation or 0,
+		Rotation     = rotation or 0,
 	})
 end
 
--- Costruisce un ScreenGui completo e ritorna le maniglie a ogni componente.
 local function buildHud()
 	local gui = new("ScreenGui", {
 		Name           = "ShipHUD",
@@ -92,9 +140,8 @@ local function buildHud()
 		Parent         = PlayerGui,
 	})
 
-	-- ---- Vignette (gradient-only, niente asset dependency)
+	-- ---- Vignette
 	local vignetteFrame = new("Frame", {
-		Name                   = "VignetteFrame",
 		Size                   = UDim2.fromScale(1, 1),
 		BackgroundColor3       = Color3.new(0, 0, 0),
 		BackgroundTransparency = 0.55,
@@ -113,67 +160,168 @@ local function buildHud()
 		Rotation = 90,
 	})
 
-	-- ---- Mobile crosshair (mira) -----------------------------------------
-	-- Piccolo crosshair che segue il punto di mira (mouse o muso). Indica sia
-	-- dove andra' a sparare, sia dove la nave virera'. Niente piu' mega-ring
-	-- statico al centro.
+	-- ---- Reticle (center) -------------------------------------------------
 	local reticle = new("Frame", {
 		Name                   = "Reticle",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(28, 28),
+		Size                   = UDim2.fromOffset(180, 180),
 		BackgroundTransparency = 1,
 		Parent                 = gui,
 	})
 
-	-- Anello esterno sottile
 	local outerRing = new("Frame", {
-		Name                   = "Ring",
+		Name                   = "OuterRing",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
 		Size                   = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
 		Parent                 = reticle,
 	})
-	stroke(outerRing, PALETTE.primary, 1.2, 0.15)
+	stroke(outerRing, PALETTE.primary, 1.2, 0.25)
 	corner(outerRing, 999)
+	new("UIGradient", {
+		Parent       = outerRing:FindFirstChildOfClass("UIStroke"),
+		Color        = ColorSequence.new(PALETTE.primary),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0,    0.1),
+			NumberSequenceKeypoint.new(0.25, 1),
+			NumberSequenceKeypoint.new(0.5,  0.1),
+			NumberSequenceKeypoint.new(0.75, 1),
+			NumberSequenceKeypoint.new(1,    0.1),
+		}),
+	})
 
-	-- Dot centrale
+	local innerRing = new("Frame", {
+		Name                   = "InnerRing",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Position               = UDim2.fromScale(0.5, 0.5),
+		Size                   = UDim2.fromOffset(54, 54),
+		BackgroundTransparency = 1,
+		Parent                 = reticle,
+	})
+	local innerRingStroke = stroke(innerRing, PALETTE.primary, 1.5, 0.1)
+	corner(innerRing, 999)
+
 	local dot = new("Frame", {
 		Name                   = "Dot",
 		AnchorPoint            = Vector2.new(0.5, 0.5),
 		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(2, 2),
-		BackgroundColor3       = PALETTE.primary,
+		Size                   = UDim2.fromOffset(3, 3),
+		BackgroundColor3       = PALETTE.text,
 		BorderSizePixel        = 0,
 		Parent                 = reticle,
 	})
 	corner(dot, 999)
 
-	-- 4 trattini cardinali (T/D/L/R) intorno al ring per dare profondita'
 	for i, rot in ipairs({0, 90, 180, 270}) do
-		local tickC = new("Frame", {
+		local tick = new("Frame", {
+			Name                   = "Tick" .. i,
 			AnchorPoint            = Vector2.new(0.5, 0.5),
 			Position               = UDim2.fromScale(0.5, 0.5),
-			Size                   = UDim2.fromOffset(2, 22),
+			Size                   = UDim2.fromOffset(2, 96),
 			BackgroundTransparency = 1,
 			Rotation               = rot,
 			Parent                 = reticle,
 		})
 		new("Frame", {
-			AnchorPoint            = Vector2.new(0.5, 0),
-			Position               = UDim2.fromScale(0.5, 0),
-			Size                   = UDim2.fromOffset(2, 4),
-			BackgroundColor3       = PALETTE.primary,
-			BorderSizePixel        = 0,
-			Parent                 = tickC,
+			AnchorPoint      = Vector2.new(0.5, 0),
+			Position         = UDim2.new(0.5, 0, 0, 0),
+			Size             = UDim2.fromOffset(2, 14),
+			BackgroundColor3 = PALETTE.primary,
+			BorderSizePixel  = 0,
+			Parent           = tick,
+		})
+		new("Frame", {
+			AnchorPoint      = Vector2.new(0.5, 1),
+			Position         = UDim2.new(0.5, 0, 1, 0),
+			Size             = UDim2.fromOffset(2, 14),
+			BackgroundColor3 = PALETTE.primary,
+			BorderSizePixel  = 0,
+			Parent           = tick,
 		})
 	end
 
-	-- alias per compatibilita' col vecchio codice che chiama InnerRing
-	local innerRing      = outerRing
-	-- (rimosso il reload arc; lo stato di reload e' indicato col tint del reticle)
-	local reloadGradient = Instance.new("UIGradient")  -- noop, evita nil-refs
+	-- Reload arc
+	local reloadFrame = new("Frame", {
+		Name                   = "ReloadFrame",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Position               = UDim2.fromScale(0.5, 0.5),
+		Size                   = UDim2.fromOffset(212, 212),
+		BackgroundTransparency = 1,
+		Parent                 = reticle,
+	})
+	local reloadStroke = stroke(reloadFrame, PALETTE.accent, 2, 0)
+	corner(reloadFrame, 999)
+	local reloadGradient = new("UIGradient", {
+		Parent       = reloadStroke,
+		Color        = ColorSequence.new(PALETTE.accent),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0,     0),
+			NumberSequenceKeypoint.new(0.001, 0),
+			NumberSequenceKeypoint.new(0.002, 1),
+			NumberSequenceKeypoint.new(1,     1),
+		}),
+		Rotation = -90,
+	})
+
+	-- ---- Crosshair virtuale (combat, segue deflessione mouse) -------------
+	local crosshairElem = new("Frame", {
+		Name                   = "Crosshair",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Position               = UDim2.fromScale(0.5, 0.5),
+		Size                   = UDim2.fromOffset(14, 14),
+		BackgroundTransparency = 1,
+		Visible                = false,
+		ZIndex                 = 12,
+		Parent                 = gui,
+	})
+	stroke(crosshairElem, PALETTE.accent, 1.5, 0)
+	corner(crosshairElem, 999)
+	new("Frame", {
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		Position         = UDim2.fromScale(0.5, 0.5),
+		Size             = UDim2.fromOffset(10, 1.5),
+		BackgroundColor3 = PALETTE.accent,
+		BorderSizePixel  = 0,
+		ZIndex           = 12,
+		Parent           = crosshairElem,
+	})
+	new("Frame", {
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		Position         = UDim2.fromScale(0.5, 0.5),
+		Size             = UDim2.fromOffset(1.5, 10),
+		BackgroundColor3 = PALETTE.accent,
+		BorderSizePixel  = 0,
+		ZIndex           = 12,
+		Parent           = crosshairElem,
+	})
+
+	-- ---- Lead indicator (posizione futura del bersaglio) ------------------
+	local leadIndicator = new("Frame", {
+		Name                   = "LeadIndicator",
+		AnchorPoint            = Vector2.new(0.5, 0.5),
+		Size                   = UDim2.fromOffset(18, 18),
+		BackgroundTransparency = 1,
+		Visible                = false,
+		ZIndex                 = 11,
+		Parent                 = gui,
+	})
+	local leadStroke = stroke(leadIndicator, PALETTE.primary, 2, 0)
+	corner(leadIndicator, 999)
+
+	-- ---- Target bounding box (4 linee) ------------------------------------
+	local boxLines = {}
+	for i = 1, 4 do
+		boxLines[i] = new("Frame", {
+			Name             = "BoxLine" .. i,
+			BackgroundColor3 = PALETTE.primary,
+			BorderSizePixel  = 0,
+			Visible          = false,
+			ZIndex           = 10,
+			Parent           = gui,
+		})
+	end
 
 	-- ---- TOP-LEFT: Ship info card ----------------------------------------
 	local infoCard = new("Frame", {
@@ -187,17 +335,14 @@ local function buildHud()
 	})
 	corner(infoCard, 4)
 	stroke(infoCard, PALETTE.primaryDim, 1, 0.2)
-
-	-- Accent bar on the left side of the card
 	local accentBar = new("Frame", {
-		Size              = UDim2.new(0, 3, 1, -16),
-		Position          = UDim2.new(0, 0, 0, 8),
-		BackgroundColor3  = PALETTE.primary,
-		BorderSizePixel   = 0,
-		Parent            = infoCard,
+		Size             = UDim2.new(0, 3, 1, -16),
+		Position         = UDim2.new(0, 0, 0, 8),
+		BackgroundColor3 = PALETTE.primary,
+		BorderSizePixel  = 0,
+		Parent           = infoCard,
 	})
 	corner(accentBar, 2)
-
 	local shipLabel = new("TextLabel", {
 		Name                   = "ShipName",
 		Position               = UDim2.fromOffset(16, 10),
@@ -222,8 +367,6 @@ local function buildHud()
 		Text                   = "STARFIGHTER  /  ONLINE",
 		Parent                 = infoCard,
 	})
-
-	-- Mode chip
 	local modeChip = new("Frame", {
 		Name                   = "ModeChip",
 		AnchorPoint            = Vector2.new(0, 1),
@@ -242,177 +385,8 @@ local function buildHud()
 		Font                   = Enum.Font.GothamBold,
 		TextSize               = 11,
 		TextColor3             = PALETTE.primary,
-		Text                   = "CRUISE",
+		Text                   = "HANGAR",
 		Parent                 = modeChip,
-	})
-
-	-- Hover badge (only when CanHover is on)
-	local hoverChip = new("Frame", {
-		Name                   = "HoverChip",
-		AnchorPoint            = Vector2.new(0, 1),
-		Position               = UDim2.new(0, 136, 1, -10),
-		Size                   = UDim2.fromOffset(90, 22),
-		BackgroundColor3       = PALETTE.accent,
-		BackgroundTransparency = 0.9,
-		BorderSizePixel        = 0,
-		Visible                = false,
-		Parent                 = infoCard,
-	})
-	corner(hoverChip, 3)
-	stroke(hoverChip, PALETTE.accent, 1, 0.4)
-	new("TextLabel", {
-		Size                   = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Font                   = Enum.Font.GothamBold,
-		TextSize               = 11,
-		TextColor3             = PALETTE.accent,
-		Text                   = "HOVER [N]",
-		Parent                 = hoverChip,
-	})
-
-	-- ---- TOP-LEFT (sotto InfoCard): Boost gauge -------------------------
-	local boostCard = new("Frame", {
-		Name                   = "Boost",
-		Position               = UDim2.fromOffset(28, 28 + 96 + 8),
-		Size                   = UDim2.fromOffset(280, 28),
-		BackgroundColor3       = PALETTE.panel,
-		BackgroundTransparency = 0.3,
-		BorderSizePixel        = 0,
-		Parent                 = gui,
-	})
-	corner(boostCard, 4)
-	stroke(boostCard, PALETTE.primaryDim, 1, 0.3)
-
-	new("TextLabel", {
-		Position               = UDim2.fromOffset(12, 8),
-		Size                   = UDim2.fromOffset(60, 14),
-		BackgroundTransparency = 1,
-		Font                   = Enum.Font.GothamBold,
-		TextSize               = 10,
-		TextColor3             = PALETTE.textDim,
-		TextXAlignment         = Enum.TextXAlignment.Left,
-		Text                   = "BOOST",
-		Parent                 = boostCard,
-	})
-
-	local boostBarBg = new("Frame", {
-		Position               = UDim2.fromOffset(72, 10),
-		Size                   = UDim2.new(1, -84, 0, 8),
-		BackgroundColor3       = PALETTE.bg,
-		BorderSizePixel        = 0,
-		Parent                 = boostCard,
-	})
-	corner(boostBarBg, 3)
-
-	local boostBarFill = new("Frame", {
-		Size                   = UDim2.new(1, 0, 1, 0),
-		BackgroundColor3       = PALETTE.accent,
-		BorderSizePixel        = 0,
-		Parent                 = boostBarBg,
-	})
-	corner(boostBarFill, 3)
-
-	-- ---- TOP-LEFT (sotto Boost): Vitals (Shields + Hull) -----------------
-	local vitalsCard = new("Frame", {
-		Name                   = "Vitals",
-		Position               = UDim2.fromOffset(28, 28 + 96 + 8 + 28 + 8),
-		Size                   = UDim2.fromOffset(280, 50),
-		BackgroundColor3       = PALETTE.panel,
-		BackgroundTransparency = 0.3,
-		BorderSizePixel        = 0,
-		Parent                 = gui,
-	})
-	corner(vitalsCard, 4)
-	stroke(vitalsCard, PALETTE.primaryDim, 1, 0.3)
-
-	local function vitalsRow(y, label, color)
-		new("TextLabel", {
-			Position               = UDim2.fromOffset(12, y),
-			Size                   = UDim2.fromOffset(60, 14),
-			BackgroundTransparency = 1,
-			Font                   = Enum.Font.GothamBold,
-			TextSize               = 10,
-			TextColor3             = PALETTE.textDim,
-			TextXAlignment         = Enum.TextXAlignment.Left,
-			Text                   = label,
-			Parent                 = vitalsCard,
-		})
-		local bg = new("Frame", {
-			Position               = UDim2.fromOffset(72, y + 2),
-			Size                   = UDim2.new(1, -84, 0, 8),
-			BackgroundColor3       = PALETTE.bg,
-			BorderSizePixel        = 0,
-			Parent                 = vitalsCard,
-		})
-		corner(bg, 3)
-		local fill = new("Frame", {
-			Size                   = UDim2.fromScale(1, 1),
-			BackgroundColor3       = color,
-			BorderSizePixel        = 0,
-			Parent                 = bg,
-		})
-		corner(fill, 3)
-		return fill
-	end
-
-	local shieldsFill = vitalsRow(6,  "SHIELDS", PALETTE.primary)
-	local healthFill  = vitalsRow(28, "HULL",    PALETTE.good)
-
-	-- ---- Lock-on bracket (overlay sopra il target) ----------------------
-	local lockBracket = new("Frame", {
-		Name                   = "LockBracket",
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Size                   = UDim2.fromOffset(60, 60),
-		BackgroundTransparency = 1,
-		Visible                = false,
-		Parent                 = gui,
-	})
-	-- 4 angoli del bracket
-	for _, corner_data in ipairs({
-		{ Vector2.new(0, 0), 0,   0   },  -- top-left
-		{ Vector2.new(1, 0), 1,   0   },  -- top-right
-		{ Vector2.new(0, 1), 0,   1   },  -- bottom-left
-		{ Vector2.new(1, 1), 1,   1   },  -- bottom-right
-	}) do
-		local anchor, sx, sy = corner_data[1], corner_data[2], corner_data[3]
-		-- linea orizzontale
-		new("Frame", {
-			AnchorPoint            = anchor,
-			Position               = UDim2.fromScale(sx, sy),
-			Size                   = UDim2.fromOffset(14, 2),
-			BackgroundColor3       = PALETTE.danger,
-			BorderSizePixel        = 0,
-			Parent                 = lockBracket,
-		})
-		-- linea verticale
-		new("Frame", {
-			AnchorPoint            = anchor,
-			Position               = UDim2.fromScale(sx, sy),
-			Size                   = UDim2.fromOffset(2, 14),
-			BackgroundColor3       = PALETTE.danger,
-			BorderSizePixel        = 0,
-			Parent                 = lockBracket,
-		})
-	end
-
-	-- Lead reticle: punto predittivo dove sparare per colpire il target.
-	local leadReticle = new("Frame", {
-		Name                   = "LeadReticle",
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Size                   = UDim2.fromOffset(14, 14),
-		BackgroundTransparency = 1,
-		Visible                = false,
-		Parent                 = gui,
-	})
-	stroke(leadReticle, PALETTE.accent, 1.5, 0)
-	corner(leadReticle, 999)
-	new("Frame", {
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Position               = UDim2.fromScale(0.5, 0.5),
-		Size                   = UDim2.fromOffset(2, 2),
-		BackgroundColor3       = PALETTE.accent,
-		BorderSizePixel        = 0,
-		Parent                 = leadReticle,
 	})
 
 	-- ---- BOTTOM-LEFT: Speedometer ----------------------------------------
@@ -428,7 +402,6 @@ local function buildHud()
 	})
 	corner(speedCard, 4)
 	stroke(speedCard, PALETTE.primaryDim, 1, 0.3)
-
 	new("TextLabel", {
 		Position               = UDim2.fromOffset(14, 8),
 		Size                   = UDim2.new(0, 80, 0, 12),
@@ -440,7 +413,6 @@ local function buildHud()
 		Text                   = "VELOCITY",
 		Parent                 = speedCard,
 	})
-
 	local speedValue = new("TextLabel", {
 		Position               = UDim2.fromOffset(14, 22),
 		Size                   = UDim2.new(0, 130, 0, 36),
@@ -463,21 +435,19 @@ local function buildHud()
 		Text                   = "STUDS/SEC",
 		Parent                 = speedCard,
 	})
-
-	-- Speed fill bar
 	local speedBarBg = new("Frame", {
-		Position               = UDim2.fromOffset(14, 60),
-		Size                   = UDim2.new(1, -28, 0, 4),
-		BackgroundColor3       = PALETTE.bg,
-		BorderSizePixel        = 0,
-		Parent                 = speedCard,
+		Position         = UDim2.fromOffset(14, 60),
+		Size             = UDim2.new(1, -28, 0, 4),
+		BackgroundColor3 = PALETTE.bg,
+		BorderSizePixel  = 0,
+		Parent           = speedCard,
 	})
 	corner(speedBarBg, 2)
 	local speedBarFill = new("Frame", {
-		Size                   = UDim2.new(0, 0, 1, 0),
-		BackgroundColor3       = PALETTE.primary,
-		BorderSizePixel        = 0,
-		Parent                 = speedBarBg,
+		Size             = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = PALETTE.primary,
+		BorderSizePixel  = 0,
+		Parent           = speedBarBg,
 	})
 	corner(speedBarFill, 2)
 	gradient(speedBarFill, ColorSequence.new({
@@ -485,14 +455,12 @@ local function buildHud()
 		ColorSequenceKeypoint.new(1, PALETTE.accent),
 	}))
 
-	-- ---- RIGHT (above Altitude): Controls / keybinds --------------------
-	-- Card piu' STRETTA (180) ma piu' ALTA (260) con righe piu' grandi e
-	-- testo piu' leggibile. Sta sopra l'altimetro con un gap di 12.
+	-- ---- BOTTOM-RIGHT (sopra Altitude): Controls / keybinds --------------
 	local ctrlCard = new("Frame", {
 		Name                   = "Controls",
 		AnchorPoint            = Vector2.new(1, 1),
 		Position               = UDim2.new(1, -28, 1, -28 - 240 - 12),
-		Size                   = UDim2.fromOffset(180, 344),  -- aumentato per ospitare V, SHIFT, TAB
+		Size                   = UDim2.fromOffset(180, 280),
 		BackgroundColor3       = PALETTE.panel,
 		BackgroundTransparency = 0.25,
 		BorderSizePixel        = 0,
@@ -500,7 +468,6 @@ local function buildHud()
 	})
 	corner(ctrlCard, 4)
 	stroke(ctrlCard, PALETTE.primaryDim, 1, 0.2)
-
 	new("TextLabel", {
 		Position               = UDim2.fromOffset(14, 10),
 		Size                   = UDim2.new(1, -28, 0, 14),
@@ -512,8 +479,6 @@ local function buildHud()
 		Text                   = "CONTROLS",
 		Parent                 = ctrlCard,
 	})
-
-	-- Linea di separazione sottile sotto il titolo
 	new("Frame", {
 		Position               = UDim2.fromOffset(14, 28),
 		Size                   = UDim2.new(1, -28, 0, 1),
@@ -522,7 +487,6 @@ local function buildHud()
 		BorderSizePixel        = 0,
 		Parent                 = ctrlCard,
 	})
-
 	local controlsRowContainer = new("Frame", {
 		Position               = UDim2.fromOffset(10, 36),
 		Size                   = UDim2.new(1, -20, 1, -46),
@@ -530,22 +494,19 @@ local function buildHud()
 		Parent                 = ctrlCard,
 	})
 	new("UIListLayout", {
-		Parent          = controlsRowContainer,
-		Padding         = UDim.new(0, 3),
-		SortOrder       = Enum.SortOrder.LayoutOrder,
-		FillDirection   = Enum.FillDirection.Vertical,
+		Parent        = controlsRowContainer,
+		Padding       = UDim.new(0, 3),
+		SortOrder     = Enum.SortOrder.LayoutOrder,
+		FillDirection = Enum.FillDirection.Vertical,
 	})
 
 	local function controlRow(order, keyText, actionText)
 		local row = new("Frame", {
-			Name                   = "Row_" .. keyText,
 			Size                   = UDim2.new(1, 0, 0, 24),
 			BackgroundTransparency = 1,
 			LayoutOrder            = order,
 			Parent                 = controlsRowContainer,
 		})
-
-		-- Tasto: pill scuro con bordo cyan, piu' compatto in larghezza
 		local key = new("Frame", {
 			Size                   = UDim2.new(0, 52, 1, 0),
 			BackgroundColor3       = PALETTE.bg,
@@ -564,7 +525,6 @@ local function buildHud()
 			Text                   = keyText,
 			Parent                 = key,
 		})
-
 		new("TextLabel", {
 			Position               = UDim2.fromOffset(60, 0),
 			Size                   = UDim2.new(1, -60, 1, 0),
@@ -576,22 +536,17 @@ local function buildHud()
 			Text                   = actionText,
 			Parent                 = row,
 		})
-
 		return row
 	end
 
-	controlRow(1,  "R",     "Engine")
-	controlRow(2,  "W S",   "Accel/Brake")
-	controlRow(3,  "A D",   "Roll")
-	controlRow(4,  "Q E",   "Down/Up (Cruise)")
-	local qeRow = nil  -- riga Q/E ora sempre visibile (vale anche in flight)
-	controlRow(5,  "SHIFT", "Boost")
-	controlRow(6,  "V",     "Free Cam")
-	controlRow(7,  "TAB",   "Lock Target")
-	controlRow(8,  "N",     "Hyperdrive")
-	controlRow(9,  "LMB",   "Fire")
-	controlRow(10, "RMB",   "Zoom Aim")
-	controlRow(11, "WHEEL", "Cam Zoom")
+	controlRow(1, "R",     "Engine")
+	controlRow(2, "W S",   "Throttle")
+	controlRow(3, "A D",   "Turn (Hangar)")
+	controlRow(4, "N",     "Hangar/Combat")
+	controlRow(5, "C",     "Camera")
+	controlRow(6, "LMB",   "Fire")
+	controlRow(7, "RMB",   "Zoom Aim")
+	controlRow(8, "WHEEL", "Cam Zoom")
 
 	-- ---- BOTTOM-RIGHT: Altitude ------------------------------------------
 	local altCard = new("Frame", {
@@ -606,7 +561,6 @@ local function buildHud()
 	})
 	corner(altCard, 4)
 	stroke(altCard, PALETTE.primaryDim, 1, 0.3)
-
 	new("TextLabel", {
 		Position               = UDim2.fromOffset(14, 8),
 		Size                   = UDim2.new(1, -28, 0, 12),
@@ -618,7 +572,6 @@ local function buildHud()
 		Text                   = "ALT",
 		Parent                 = altCard,
 	})
-
 	local altValue = new("TextLabel", {
 		AnchorPoint            = Vector2.new(1, 0),
 		Position               = UDim2.new(1, -14, 0, 6),
@@ -631,28 +584,23 @@ local function buildHud()
 		Text                   = "0",
 		Parent                 = altCard,
 	})
-
-	-- Vertical ladder/track
 	local altTrack = new("Frame", {
-		AnchorPoint            = Vector2.new(0.5, 0),
-		Position               = UDim2.new(0.5, 0, 0, 28),
-		Size                   = UDim2.new(0, 4, 1, -42),
-		BackgroundColor3       = PALETTE.bg,
-		BorderSizePixel        = 0,
-		Parent                 = altCard,
+		AnchorPoint      = Vector2.new(0.5, 0),
+		Position         = UDim2.new(0.5, 0, 0, 28),
+		Size             = UDim2.new(0, 4, 1, -42),
+		BackgroundColor3 = PALETTE.bg,
+		BorderSizePixel  = 0,
+		Parent           = altCard,
 	})
 	corner(altTrack, 2)
-
 	local altNeedle = new("Frame", {
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Position               = UDim2.new(0.5, 0, 0.5, 0),
-		Size                   = UDim2.new(0, 24, 0, 2),
-		BackgroundColor3       = PALETTE.primary,
-		BorderSizePixel        = 0,
-		Parent                 = altTrack,
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		Position         = UDim2.new(0.5, 0, 0.5, 0),
+		Size             = UDim2.fromOffset(24, 2),
+		BackgroundColor3 = PALETTE.primary,
+		BorderSizePixel  = 0,
+		Parent           = altTrack,
 	})
-
-	-- Tick marks down the side of the track
 	for i = 0, 10 do
 		local y = i / 10
 		new("Frame", {
@@ -679,7 +627,6 @@ local function buildHud()
 	})
 	corner(thrCard, 4)
 	stroke(thrCard, PALETTE.primaryDim, 1, 0.3)
-
 	new("TextLabel", {
 		Position               = UDim2.fromOffset(14, 4),
 		Size                   = UDim2.new(0, 80, 0, 12),
@@ -691,33 +638,29 @@ local function buildHud()
 		Text                   = "THROTTLE",
 		Parent                 = thrCard,
 	})
-
 	local thrBarBg = new("Frame", {
-		Position               = UDim2.fromOffset(14, 22),
-		Size                   = UDim2.new(1, -28, 0, 6),
-		BackgroundColor3       = PALETTE.bg,
-		BorderSizePixel        = 0,
-		Parent                 = thrCard,
+		Position         = UDim2.fromOffset(14, 22),
+		Size             = UDim2.new(1, -28, 0, 6),
+		BackgroundColor3 = PALETTE.bg,
+		BorderSizePixel  = 0,
+		Parent           = thrCard,
 	})
 	corner(thrBarBg, 3)
-
-	-- Center notch for "zero" throttle
 	new("Frame", {
-		AnchorPoint            = Vector2.new(0.5, 0),
-		Position               = UDim2.new(0.5, 0, 0, -2),
-		Size                   = UDim2.fromOffset(1, 10),
-		BackgroundColor3       = PALETTE.textDim,
-		BorderSizePixel        = 0,
-		Parent                 = thrBarBg,
+		AnchorPoint      = Vector2.new(0.5, 0),
+		Position         = UDim2.new(0.5, 0, 0, -2),
+		Size             = UDim2.fromOffset(1, 10),
+		BackgroundColor3 = PALETTE.textDim,
+		BorderSizePixel  = 0,
+		Parent           = thrBarBg,
 	})
-
 	local thrFill = new("Frame", {
-		AnchorPoint            = Vector2.new(0.5, 0.5),
-		Position               = UDim2.new(0.5, 0, 0.5, 0),
-		Size                   = UDim2.fromScale(0, 1),
-		BackgroundColor3       = PALETTE.primary,
-		BorderSizePixel        = 0,
-		Parent                 = thrBarBg,
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		Position         = UDim2.new(0.5, 0, 0.5, 0),
+		Size             = UDim2.fromScale(0, 1),
+		BackgroundColor3 = PALETTE.primary,
+		BorderSizePixel  = 0,
+		Parent           = thrBarBg,
 	})
 	corner(thrFill, 3)
 
@@ -734,7 +677,6 @@ local function buildHud()
 	})
 	corner(teleCard, 4)
 	stroke(teleCard, PALETTE.primaryDim, 1, 0.2)
-
 	local function teleRow(y, label)
 		new("TextLabel", {
 			Position               = UDim2.fromOffset(14, y),
@@ -760,7 +702,6 @@ local function buildHud()
 			Parent                 = teleCard,
 		})
 	end
-
 	local pitchValue   = teleRow(12, "PITCH")
 	local rollValue    = teleRow(34, "ROLL")
 	local headingValue = teleRow(56, "HEADING")
@@ -778,41 +719,40 @@ local function buildHud()
 	})
 
 	return {
-		Gui            = gui,
-		Reticle        = reticle,
-		OuterRing      = outerRing,
-		InnerRing      = innerRing,
-		ReloadGradient = reloadGradient,
-		ShipLabel      = shipLabel,
-		SubLabel       = subLabel,
-		ModeChip       = modeChip,
-		ModeLabel      = modeLabel,
-		HoverChip      = hoverChip,
-		SpeedValue     = speedValue,
-		SpeedBarFill   = speedBarFill,
-		AltValue       = altValue,
-		AltNeedle      = altNeedle,
-		AltTrack       = altTrack,
-		ThrFill        = thrFill,
-		Pitch          = pitchValue,
-		Roll           = rollValue,
-		Heading        = headingValue,
-		Dmg            = dmgValue,
-		HitFlash       = hitFlash,
-		ControlsCard   = ctrlCard,
-		QERow          = qeRow,
-		BoostFill      = boostBarFill,
-		ShieldsFill    = shieldsFill,
-		HealthFill     = healthFill,
-		LockBracket    = lockBracket,
-		LeadReticle    = leadReticle,
+		Gui             = gui,
+		Reticle         = reticle,
+		OuterRing       = outerRing,
+		InnerRing       = innerRing,
+		InnerRingStroke = innerRingStroke,
+		ReloadGradient  = reloadGradient,
+		ShipLabel       = shipLabel,
+		SubLabel        = subLabel,
+		ModeChip        = modeChip,
+		ModeLabel       = modeLabel,
+		SpeedValue      = speedValue,
+		SpeedBarFill    = speedBarFill,
+		AltValue        = altValue,
+		AltNeedle       = altNeedle,
+		AltTrack        = altTrack,
+		ThrFill         = thrFill,
+		Pitch           = pitchValue,
+		Roll            = rollValue,
+		Heading         = headingValue,
+		Dmg             = dmgValue,
+		HitFlash        = hitFlash,
+		ControlsCard    = ctrlCard,
+		-- Nuovi elementi combat
+		Crosshair       = crosshairElem,
+		LeadIndicator   = leadIndicator,
+		LeadStroke      = leadStroke,
+		BoxLines        = boxLines,
 	}
 end
 
 local HUD = buildHud()
 
 -- ============================================================================
--- HUD HELPERS  (animazioni, reattivita')
+-- HUD HELPERS
 -- ============================================================================
 
 local function tween(obj, t, props, style, dir)
@@ -823,10 +763,9 @@ local function tween(obj, t, props, style, dir)
 end
 
 local function pulseRingOnFire()
-	-- Piccolo bump del reticolo mobile a ogni colpo
-	tween(HUD.Reticle, 0.05, { Size = UDim2.fromOffset(36, 36) })
-	task.delay(0.06, function()
-		tween(HUD.Reticle, 0.16, { Size = UDim2.fromOffset(28, 28) })
+	tween(HUD.InnerRing, 0.08, { Size = UDim2.fromOffset(38, 38) })
+	task.delay(0.09, function()
+		tween(HUD.InnerRing, 0.18, { Size = UDim2.fromOffset(54, 54) })
 	end)
 end
 
@@ -856,180 +795,229 @@ end
 -- FLIGHT STATE
 -- ============================================================================
 
-local CRUISE_SPEED_FACTOR = 0.5    -- W in cruise = 50% MaxSpeed
-local FULL_SPEED_FACTOR   = 1.0
-local HOVER_HORIZ_FACTOR  = 0.4    -- velocita' WASD in hover come % di MaxSpeed
-local HOVER_HORIZ_CAP     = 80
-local HOVER_VERT_SPEED    = 45     -- studs/sec Q/E
-local FLIGHT_CHASE_BACK   = 22     -- offset chase-cam dietro la nave se manca CameraPart
-local FLIGHT_CHASE_UP     = 7
-local AIM_TURN_SMOOTH     = 8      -- snappy ma non instantaneo
-
--- Boost / afterburner (Shift)
-local BOOST_MULTIPLIER    = 1.7    -- moltiplicatore di fullMax quando attivo
-local BOOST_DRAIN_PER_SEC = 0.35   -- gauge drain (1.0 gauge = piena)
-local BOOST_REGEN_PER_SEC = 0.18   -- gauge regen quando rilasciato
-local BOOST_MIN_TO_START  = 0.10   -- soglia per attivare boost
-local BOOST_FOV_BONUS     = 12     -- FOV extra a boost pieno
-local BASE_FOV            = 70     -- FOV "a regime"
-
--- Hyperdrive (N premuto in flight = ali chiuse, max speed, FOV wider, armi off)
-local HYPERDRIVE_FOV_BONUS = 10    -- FOV extra in hyperdrive
-local HYPERDRIVE_SPEED_MUL = 1.8   -- moltiplicatore di fullMax in hyperdrive
-
--- Auto-banking: la nave si inclina automaticamente nelle curve
-local AUTO_BANK_AMOUNT     = 1.1   -- max roll target in radianti (~63 gradi)
-local AUTO_BANK_LERP       = 6     -- velocita' con cui converge al target
-
--- Camera recoil (kick quando si spara)
-local RECOIL_KICK_BACK    = 0.5    -- studs di kick indietro per colpo
-local RECOIL_KICK_PITCH   = 0.018  -- radianti di kick verso l'alto per colpo
-local RECOIL_DECAY        = 11     -- lambda damping del recoil verso zero
-local RECOIL_MAX_BACK     = 2.5    -- cap del kick accumulato
-local RECOIL_MAX_PITCH    = 0.09
-
--- Lock-on (Tab cicla i target nemici)
-local LOCK_RANGE      = 1500    -- studs max per acquisire target
-local LOCK_CONE_DEG   = 35      -- angolo max dal muso per acquisire
-local LOCK_LOSE_DEG   = 60      -- se va oltre questo angolo, perdi il lock
-local LOCK_LASER_SPEED = 750    -- deve combaciare con LASER_SPEED del server
-
--- Free cam (V per toggle chase <-> free orbit)
--- In free cam la nave mantiene la rotta corrente (heading bloccato), il mouse
--- ruota la camera attorno alla nave (yaw + pitch), il wheel regola la distanza.
--- Per tornare a sterzare col mouse, ripremi V.
-local FREE_MIN_DIST       = 12
-local FREE_MAX_DIST       = 80
-local FREE_DEFAULT_DIST   = 28
-local FREE_MOUSE_SENS     = 0.005   -- rad / pixel
-
 local state = {
-	ship           = nil,
-	seat           = nil,
-	primary        = nil,
-	gyro           = nil,
-	velocity       = nil,
-	camPart        = nil,
-	zoomPart       = nil,
+	ship     = nil,
+	seat     = nil,
+	primary  = nil,
+	gyro     = nil,
+	velocity = nil,
+	camPart  = nil,
+	zoomPart = nil,
 
-	-- mode: "hover" | "flight" (zoomMode e' separato; e' la mira RMB)
-	mode           = "flight",
-	sfoils         = false,
+	-- "hangar" | "combat"
+	mode     = "hangar",
+	sfoils   = false,
+	engineOn = false,
 
-	-- engine master switch (premi R per avviare/spegnere)
-	engineOn       = false,
+	-- Velocita' scalare corrente (studs/sec)
+	currentSpeed = 0,
 
-	-- flight
-	currentSpeed   = 0,
-	rollAngle      = 0,
-	chaseDistance  = 0,         -- mouse wheel in flight
-	aimCFrame      = nil,       -- target CFrame del gyro, lerped per fluidita'
+	-- Camera chase (scroll in combat)
+	chaseDistance = 0,
 
-	-- hover (free orbit camera around ship)
-	hoverYaw       = 0,
-	hoverPitch     = -0.15,
-	hoverDistance  = 28,
-	heldHeading    = nil,       -- CFrame da mantenere quando WASD = 0
+	-- Camera orbita (hangar + combat free-look)
+	hoverYaw      = 0,
+	hoverPitch    = -0.15,
+	hoverDistance = 28,
+	freeLook      = false,
 
-	-- zoom / aim
-	zoomMode       = false,
+	-- Hangar: yaw della nave (integrato da A/D)
+	hangarYaw = 0,
 
-	-- camera view (chase <-> free orbit) -- gestito con V
-	camView        = "chase",         -- "chase" | "free"
-	freeYaw        = 0,
-	freePitch      = -0.15,
-	freeDistance   = FREE_DEFAULT_DIST,
+	-- Combat: Euler yaw/pitch del muso
+	aimYaw   = 0,
+	aimPitch = 0,
+	bank     = 0,
+	roll     = 0,  -- roll manuale A/D (accumulato, 360° libero)
 
-	-- camera recoil (decay per-frame)
-	recoilBack     = 0,
-	recoilPitch    = 0,
+	-- Combat: velocita' inerziale (drift)
+	flightVel = Vector3.zero,
 
-	-- boost / afterburner (hold Shift)
-	boost          = 1,               -- 0..1 gauge
-	boostActive    = false,
-	boostFactor    = 1,                -- 1..BOOST_MULTIPLIER (smoothed)
+	-- Combat: CFrame interpolato del gyro
+	aimCFrame = nil,
 
-	-- shooting
-	shooting       = false,
-	lastShot       = -math.huge,
+	-- Crosshair: deflessione pixel (Vector2)
+	crosshairOffset = Vector2.zero,
 
-	-- lock-on (Tab cicla)
-	lockedTarget   = nil,        -- Model nave bloccata
-	lockedHrp      = nil,        -- BasePart usato per tracking velocita'
-	lockLastPos    = nil,        -- per stimare velocita' del target
-	lockLastT      = 0,
-	lockedVelocity = Vector3.zero,
-	leadPoint      = nil,        -- Vector3 del punto predittivo (per sparare)
+	-- Targeting
+	candidates     = {},
+	target         = nil,
+	leadWorld      = nil,
+	leadScreen     = nil,
+	aligned        = false,
+	candidateTimer = 0,
 
-	-- vitals tracking (per flash quando vieni colpito)
-	prevShields    = math.huge,
-	prevHealth     = math.huge,
+	-- Zoom / aim RMB
+	zoomMode = false,
 
-	config = { Damage = 30, MaxSpeed = 150, ReloadSpeed = 0.18, CanHover = false, FireSound = "" },
+	-- Shooting
+	shooting = false,
+	lastShot = -math.huge,
+
+	config = {
+		Damage      = 30,
+		MaxSpeed    = 150,
+		ReloadSpeed = 0.18,
+		Faction     = "Republic",
+		FireSound   = "",
+	},
 }
-
-local MIN_CHASE, MAX_CHASE = -10, 80
-local MIN_HOVER, MAX_HOVER = 12, 70
 
 local function readShipConfig(ship)
 	state.config.Damage      = ship:GetAttribute("Damage")      or 30
 	state.config.MaxSpeed    = ship:GetAttribute("MaxSpeed")    or 150
 	state.config.ReloadSpeed = ship:GetAttribute("ReloadSpeed") or 0.18
-	state.config.CanHover    = ship:GetAttribute("CanHover")    or false
+	state.config.Faction     = ship:GetAttribute("Faction")     or "Republic"
 	state.config.FireSound   = ship:GetAttribute("FireSound")   or ""
 end
 
--- ----------------------------------------------------------------------------
--- Input helpers: leggiamo la tastiera direttamente (NIENTE VehicleSeat.Throttle
--- o .Steer) cosi' l'orientamento del seat non puo' invertire i comandi.
--- ----------------------------------------------------------------------------
+-- ============================================================================
+-- INPUT HELPERS
+-- ============================================================================
 local function key(k) return UserInputService:IsKeyDown(k) end
 local function axis(pos, neg)
 	return (key(pos) and 1 or 0) - (key(neg) and 1 or 0)
 end
 
+-- W/S = throttle, A/D = yaw (hangar) / non usato direttamente in combat
 local function readMoveInput()
-	-- Q/E (su/giu') sono disponibili SOLO in cruise. In full throttle (sfoils
-	-- aperte) la nave non vira verticalmente con Q/E: deve usare il mouse.
-	-- Hover mantiene Q/E per il decollo/atterraggio.
-	local vertical = 0
-	if state.mode == "hover" or not state.sfoils then
-		vertical = axis(Enum.KeyCode.E, Enum.KeyCode.Q)
-	end
 	return
-		axis(Enum.KeyCode.W, Enum.KeyCode.S),  -- throttle  (W=+1, S=-1)
-		axis(Enum.KeyCode.D, Enum.KeyCode.A),  -- right     (D=+1, A=-1)
-		vertical                                -- up        (E=+1, Q=-1) solo in cruise/hover
+		axis(Enum.KeyCode.W, Enum.KeyCode.S),
+		axis(Enum.KeyCode.D, Enum.KeyCode.A)
 end
 
--- ----------------------------------------------------------------------------
 local function setMouseLocked(locked)
 	if locked then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		UserInputService.MouseBehavior    = Enum.MouseBehavior.LockCenter
+		UserInputService.MouseIconEnabled = false
 	else
-		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		UserInputService.MouseBehavior    = Enum.MouseBehavior.Default
+		UserInputService.MouseIconEnabled = true
 	end
-	-- Il cursore OS resta sempre nascosto durante il volo: il reticolo mobile
-	-- e' la mira (gestito su startFlight/stopFlight).
 end
+
+-- ============================================================================
+-- TARGETING
+-- ============================================================================
+
+local function refreshCandidates(shipFaction)
+	local result = {}
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Humanoid") and inst.Health > 0 then
+			local model = inst.Parent
+			if model and model:IsA("Model") then
+				local f = model:GetAttribute("Faction")
+				if f and f ~= shipFaction then
+					local root = model:FindFirstChild("HumanoidRootPart")
+						or model:FindFirstChildWhichIsA("BasePart")
+					if root then
+						table.insert(result, { model = model, root = root })
+					end
+				end
+			end
+		end
+	end
+	return result
+end
+
+local function pickTarget(candidates, noseWorld, shipPos)
+	local bestDot  = TARGET_CONE
+	local bestDist = math.huge
+	local best     = nil
+	for _, c in ipairs(candidates) do
+		local toTarget = (c.root.Position - shipPos)
+		local dist = toTarget.Magnitude
+		if dist <= TARGET_RANGE then
+			local dot = toTarget.Unit:Dot(noseWorld)
+			if dot >= TARGET_CONE then
+				if dot > bestDot or (dot == bestDot and dist < bestDist) then
+					bestDot  = dot
+					bestDist = dist
+					best     = c.model
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function worldToScreen(pos)
+	local vpPos, onScreen = camera:WorldToViewportPoint(pos)
+	if not onScreen then return nil end
+	return Vector2.new(vpPos.X, vpPos.Y)
+end
+
+local function getModelScreenRect(model)
+	local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
+	if not ok then return nil end
+	local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+	local offsets = {
+		Vector3.new( hx,  hy,  hz), Vector3.new(-hx,  hy,  hz),
+		Vector3.new( hx, -hy,  hz), Vector3.new(-hx, -hy,  hz),
+		Vector3.new( hx,  hy, -hz), Vector3.new(-hx,  hy, -hz),
+		Vector3.new( hx, -hy, -hz), Vector3.new(-hx, -hy, -hz),
+	}
+	local minX, minY, maxX, maxY
+	for _, off in ipairs(offsets) do
+		local sp = worldToScreen(cf.Position + off)
+		if sp then
+			if not minX then
+				minX, minY, maxX, maxY = sp.X, sp.Y, sp.X, sp.Y
+			else
+				if sp.X < minX then minX = sp.X end
+				if sp.Y < minY then minY = sp.Y end
+				if sp.X > maxX then maxX = sp.X end
+				if sp.Y > maxY then maxY = sp.Y end
+			end
+		end
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function hideTargetUI()
+	for _, l in ipairs(HUD.BoxLines) do l.Visible = false end
+	HUD.LeadIndicator.Visible = false
+	state.target     = nil
+	state.leadWorld  = nil
+	state.leadScreen = nil
+	state.aligned    = false
+end
+
+-- ============================================================================
+-- MODALITA' DI VOLO
+-- ============================================================================
 
 local function setMode(newMode)
 	if state.mode == newMode then return end
 	state.mode = newMode
-	if newMode == "hover" then
-		-- Inizializza yaw/pitch dalla direzione attuale della nave cosi'
-		-- l'orbital cam parte allineata col muso.
+
+	-- Inizializza camera orbita dalla nave
+	if state.primary then
+		local look = state.primary.CFrame.LookVector
+		state.hoverYaw   = math.atan2(-look.X, -look.Z)
+		state.hoverPitch = -0.15
+	end
+
+	if newMode == "hangar" then
+		state.freeLook        = false
+		state.crosshairOffset = Vector2.zero
 		if state.primary then
 			local look = state.primary.CFrame.LookVector
-			state.hoverYaw   = math.atan2(-look.X, -look.Z)
-			state.hoverPitch = -0.15
-			state.heldHeading = state.primary.CFrame
+			state.hangarYaw = math.atan2(look.X, look.Z)
 		end
-		setMouseLocked(true)
-	else
-		state.heldHeading = nil
-		state.rollAngle   = 0
-		setMouseLocked(false)
+		HUD.Crosshair.Visible = false
+		hideTargetUI()
+		HUD.InnerRingStroke.Color = PALETTE.primary
+	else -- "combat"
+		state.aimYaw   = state.hangarYaw
+		state.aimPitch = 0
+		state.bank     = 0
+		state.roll     = 0
+		if state.primary then
+			state.flightVel = state.primary.CFrame.LookVector * state.currentSpeed
+			state.aimCFrame = state.primary.CFrame
+		end
+		HUD.Crosshair.Visible = true
 	end
 end
 
@@ -1037,50 +1025,49 @@ local function startFlight(ship, seat)
 	state.ship      = ship
 	state.seat      = seat
 	state.primary   = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart")
-	state.camPart    = ship:FindFirstChild("CameraPart",  true)
-	state.zoomPart   = ship:FindFirstChild("ZoomPart",    true)
+	state.camPart   = ship:FindFirstChild("CameraPart", true)
+	state.zoomPart  = ship:FindFirstChild("ZoomPart",   true)
 	state.gyro      = state.primary and state.primary:WaitForChild("ShipGyro",     2)
 	state.velocity  = state.primary and state.primary:WaitForChild("ShipVelocity", 2)
-	state.sfoils    = false
-	state.engineOn  = false
-	state.currentSpeed = 0
-	state.rollAngle = 0
-	state.chaseDistance = 0
-	state.aimCFrame = state.primary and state.primary.CFrame or nil
-	state.zoomMode  = false
-	state.lastShot  = -math.huge
 
-	-- reset vista/boost/recoil ad ogni entrata
-	state.camView      = "chase"
-	state.freeYaw      = 0
-	state.freePitch    = -0.15
-	state.freeDistance = FREE_DEFAULT_DIST
-	state.recoilBack   = 0
-	state.recoilPitch  = 0
-	state.boost        = 1
-	state.boostActive  = false
-	state.boostFactor  = 1
-
-	-- reset lock e vitals
-	state.lockedTarget   = nil
-	state.lockedHrp      = nil
-	state.lockLastPos    = nil
-	state.lockedVelocity = Vector3.zero
-	state.leadPoint      = nil
-	state.prevShields    = ship:GetAttribute("MaxShields") or 100
-	state.prevHealth     = ship:GetAttribute("MaxHealth")  or 100
+	state.sfoils          = false
+	state.engineOn        = false
+	state.currentSpeed    = 0
+	state.chaseDistance   = 0
+	state.crosshairOffset = Vector2.zero
+	state.aimYaw          = 0
+	state.aimPitch        = 0
+	state.bank            = 0
+	state.roll            = 0
+	state.flightVel       = Vector3.zero
+	state.aimCFrame       = state.primary and state.primary.CFrame or nil
+	state.zoomMode        = false
+	state.freeLook        = false
+	state.lastShot        = -math.huge
+	state.target          = nil
+	state.leadWorld       = nil
+	state.leadScreen      = nil
+	state.aligned         = false
+	state.candidateTimer  = 0
+	state.candidates      = {}
 
 	readShipConfig(ship)
 
-	-- HUD: setup + reveal
+	if state.primary then
+		local look = state.primary.CFrame.LookVector
+		state.hangarYaw  = math.atan2(look.X, look.Z)
+		state.hoverYaw   = math.atan2(-look.X, -look.Z)
+		state.hoverPitch = -0.15
+		state.hoverDistance = 28
+	end
+
+	-- HUD reveal
 	HUD.ShipLabel.Text = ship.Name:upper()
 	HUD.SubLabel.Text  = "STARFIGHTER  /  ONLINE  /  PILOT: " .. LocalPlayer.Name:upper()
 	HUD.Dmg.Text       = string.format("%d", state.config.Damage)
-	HUD.HoverChip.Visible = state.config.CanHover
-	HUD.Gui.Enabled       = true
+	HUD.Gui.Enabled    = true
 
-	-- Reveal animation (telemetry slides in)
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost", "Vitals" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then
 			local target = card.Position
@@ -1089,31 +1076,29 @@ local function startFlight(ship, seat)
 			tween(card, 0.4, { Position = target, BackgroundTransparency = 0.25 })
 		end
 	end
-	-- Nascondi il cursore OS: la mira e' il reticolo mobile.
-	UserInputService.MouseIconEnabled = false
+	HUD.Reticle.Size = UDim2.fromOffset(120, 120)
+	tween(HUD.Reticle, 0.45, { Size = UDim2.fromOffset(180, 180) }, Enum.EasingStyle.Back)
 
-	-- Piccola "reveal" del reticolo mobile
-	HUD.Reticle.Size = UDim2.fromOffset(20, 20)
-	tween(HUD.Reticle, 0.35, { Size = UDim2.fromOffset(28, 28) }, Enum.EasingStyle.Back)
-
-	-- Mode iniziale: hover se supportata, altrimenti volo diretto
+	-- Avvio sempre in Hangar
 	state.mode = nil
-	setMode(state.config.CanHover and "hover" or "flight")
+	setMode("hangar")
+	setMouseLocked(true)
 end
 
 local function stopFlight()
 	if state.seat == nil then return end
-	camera.CameraType   = Enum.CameraType.Custom
-	camera.FieldOfView  = BASE_FOV  -- ripristina FOV (potrebbe essere alterato da cockpit/boost)
-	mouse.TargetFilter  = nil
+	camera.CameraType  = Enum.CameraType.Custom
+	mouse.TargetFilter = nil
 	setMouseLocked(false)
-	UserInputService.MouseIconEnabled = true
+
+	HUD.Crosshair.Visible     = false
+	HUD.LeadIndicator.Visible = false
+	for _, l in ipairs(HUD.BoxLines) do l.Visible = false end
+
 	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
 	if hum then hum.CameraOffset = Vector3.zero end
-	state.boostActive = false
 
-	-- HUD fade out
-	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls", "Boost", "Vitals" }) do
+	for _, name in ipairs({ "InfoCard", "Speed", "Altitude", "Throttle", "Telemetry", "Controls" }) do
 		local card = HUD.Gui:FindFirstChild(name)
 		if card then tween(card, 0.2, { BackgroundTransparency = 1 }) end
 	end
@@ -1126,152 +1111,34 @@ local function stopFlight()
 	state.primary  = nil
 	state.gyro     = nil
 	state.velocity = nil
-end
-
--- ============================================================================
--- LOCK-ON
--- ============================================================================
-
--- Trova tutte le navi (Model con VehicleSeat) diverse dalla nostra entro raggio.
-local function gatherShipTargets()
-	local out = {}
-	if not state.primary then return out end
-	local origin = state.primary.Position
-	for _, m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and m ~= state.ship then
-			local seat = m:FindFirstChildWhichIsA("VehicleSeat", true)
-			if seat then
-				local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-				if prim then
-					local d = (prim.Position - origin).Magnitude
-					if d <= LOCK_RANGE then
-						table.insert(out, { model = m, prim = prim, dist = d })
-					end
-				end
-			end
-		end
-	end
-	table.sort(out, function(a, b) return a.dist < b.dist end)
-	return out
-end
-
--- Restituisce true se il target e' nel cono frontale (entro maxDeg).
-local function inCone(targetPos, maxDeg)
-	if not state.primary then return false end
-	local fwd = (-state.primary.CFrame.LookVector)  -- muso
-	local dir = (targetPos - state.primary.Position)
-	if dir.Magnitude < 1e-3 then return true end
-	local cos = fwd.Unit:Dot(dir.Unit)
-	return cos >= math.cos(math.rad(maxDeg))
-end
-
-local function cycleLockTarget()
-	if not state.primary then return end
-	local targets = gatherShipTargets()
-	if #targets == 0 then
-		state.lockedTarget = nil
-		state.lockedHrp    = nil
-		return
-	end
-
-	-- Filtra al cono di acquisizione
-	local visible = {}
-	for _, t in ipairs(targets) do
-		if inCone(t.prim.Position, LOCK_CONE_DEG) then
-			table.insert(visible, t)
-		end
-	end
-	if #visible == 0 then
-		state.lockedTarget = nil
-		state.lockedHrp    = nil
-		return
-	end
-
-	-- Trova l'indice del lock corrente e prendi il successivo
-	local currentIdx = 0
-	for i, t in ipairs(visible) do
-		if t.model == state.lockedTarget then currentIdx = i break end
-	end
-	local nextIdx = (currentIdx % #visible) + 1
-	local pick = visible[nextIdx]
-	state.lockedTarget   = pick.model
-	state.lockedHrp      = pick.prim
-	state.lockLastPos    = pick.prim.Position
-	state.lockLastT      = os.clock()
-	state.lockedVelocity = Vector3.zero
-end
-
--- Aggiorna stima velocita' del target lockato + calcola lead point.
-local function updateLockTracking(dt)
-	local hrp = state.lockedHrp
-	if not hrp or not hrp.Parent then
-		state.lockedTarget = nil
-		state.lockedHrp    = nil
-		state.leadPoint    = nil
-		return
-	end
-
-	-- Se uscito dal cono di mantenimento, perdi il lock
-	if not inCone(hrp.Position, LOCK_LOSE_DEG) then
-		state.lockedTarget = nil
-		state.lockedHrp    = nil
-		state.leadPoint    = nil
-		return
-	end
-
-	-- Stima velocita' (smoothed)
-	local now = os.clock()
-	if state.lockLastPos then
-		local elapsed = math.max(now - state.lockLastT, 1e-3)
-		local v = (hrp.Position - state.lockLastPos) / elapsed
-		state.lockedVelocity = state.lockedVelocity:Lerp(v, 0.35)
-	end
-	state.lockLastPos = hrp.Position
-	state.lockLastT   = now
-
-	-- Lead point: dove il bullet incontrera' il target (assumendo velocita' costante).
-	-- Distanza nave -> target / velocita' proiettile = tempo di volo
-	-- Lead = targetPos + targetVel * tempo
-	local origin = state.primary.Position
-	local toTarget = hrp.Position - origin
-	local dist = toTarget.Magnitude
-	if dist < 1e-3 or LOCK_LASER_SPEED <= 0 then
-		state.leadPoint = hrp.Position
-		return
-	end
-	local tflight = dist / LOCK_LASER_SPEED
-	state.leadPoint = hrp.Position + state.lockedVelocity * tflight
-end
-
--- Proietta un punto 3D su 2D schermo. Restituisce x, y, onScreen.
-local function worldToScreen(pos)
-	local screenPt, onScreen = camera:WorldToScreenPoint(pos)
-	return screenPt.X, screenPt.Y, onScreen and screenPt.Z > 0
+	state.target   = nil
 end
 
 -- ============================================================================
 -- RENDER LOOP
 -- ============================================================================
 
-local replicateAccum  = 0
-
--- Smooth-lerp helper resistente al framerate
-local function damp(current, target, lambda, dt)
-	return current + (target - current) * (1 - math.exp(-lambda * dt))
-end
+local outerSpin      = 0
+local replicateAccum = 0
 
 RunService.RenderStepped:Connect(function(dt)
-	-- Reticle reload feedback: durante il reload tinta scura, a ready brillante.
+	-- Rotazione outer ring
+	outerSpin = (outerSpin + dt * 36) % 360
+	HUD.OuterRing.Rotation = outerSpin
+
+	-- Reload arc
 	if state.ship then
 		local since = os.clock() - state.lastShot
 		local pct   = math.clamp(since / math.max(state.config.ReloadSpeed, 0.01), 0, 1)
-		local ringStroke = HUD.OuterRing:FindFirstChildOfClass("UIStroke")
-		if ringStroke then
-			ringStroke.Transparency = 0.7 - pct * 0.55  -- 0.7 -> 0.15
-		end
+		HUD.ReloadGradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0,                        0),
+			NumberSequenceKeypoint.new(math.max(pct, 0.001),     0),
+			NumberSequenceKeypoint.new(math.min(pct + 0.001, 1), 1),
+			NumberSequenceKeypoint.new(1,                        1),
+		})
 	end
 
-	-- Detect seat changes
+	-- Detect seat
 	local detectedShip, detectedSeat = shipFromCharacter()
 	if detectedShip and detectedShip ~= state.ship then
 		startFlight(detectedShip, detectedSeat)
@@ -1284,54 +1151,28 @@ RunService.RenderStepped:Connect(function(dt)
 	-- ========================================================================
 	-- CAMERA
 	-- ========================================================================
-	local zoomPart = state.zoomPart
-	local camPart  = state.camPart
-
-	-- Decay del camera recoil verso zero (frame-rate independent)
-	state.recoilBack  = damp(state.recoilBack,  0, RECOIL_DECAY, dt)
-	state.recoilPitch = damp(state.recoilPitch, 0, RECOIL_DECAY, dt)
-
-	-- Regen del boost gauge (sempre attivo quando NON stai boostando)
-	if not state.boostActive and state.boost < 1 then
-		state.boost = math.min(1, state.boost + BOOST_REGEN_PER_SEC * dt)
-	end
-
-	-- Smoothing del boost factor verso il target (per FOV/velocita' senza scatti)
-	local targetBoostFactor = (state.boostActive and state.boost > 0)
-		and (1 + (BOOST_MULTIPLIER - 1) * math.clamp(state.boost, 0, 1))
-		or 1
-	state.boostFactor = damp(state.boostFactor, targetBoostFactor, 8, dt)
+	local inHangar   = (state.mode == "hangar")
+	local inFreeLook = (state.mode == "combat" and state.freeLook)
+	local camPart    = state.camPart
+	local zoomPart   = state.zoomPart
 
 	if state.zoomMode and zoomPart then
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = zoomPart.CFrame
-	elseif state.mode == "hover" then
-		-- Camera orbitale liberamente controllabile col mouse (LockCenter)
+	elseif inHangar or inFreeLook then
+		-- Orbita libera
 		local shipPos = state.primary.Position
 		local rot     = CFrame.Angles(0, state.hoverYaw, 0) * CFrame.Angles(state.hoverPitch, 0, 0)
 		local offset  = rot * Vector3.new(0, 0, state.hoverDistance)
 		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
-	elseif state.camView == "free" then
-		-- Free cam: orbita liberamente attorno alla nave (yaw/pitch col mouse,
-		-- wheel per la distanza). La nave NON segue piu' il cursore in questa
-		-- modalita': mantiene l'ultimo heading (impostato sotto in PHYSICS).
-		local shipPos = state.primary.Position
-		local rot     = CFrame.Angles(0, state.freeYaw, 0) * CFrame.Angles(state.freePitch, 0, 0)
-		local offset  = rot * Vector3.new(0, 0, state.freeDistance)
-		local camPos  = shipPos + Vector3.new(0, 2, 0) + offset
-		camera.CameraType = Enum.CameraType.Scriptable
-		camera.CFrame     = CFrame.lookAt(camPos, shipPos + Vector3.new(0, 2, 0))
 	else
-		-- Camera chase: la CameraPart E' la camera. Usiamo la sua CFrame
-		-- completa (posizione + orientazione). Il wheel-zoom scorre lungo
-		-- l'asse +Z locale della CameraPart (verso il dietro in Roblox).
+		-- Camera chase (CameraPart)
 		camera.CameraType = Enum.CameraType.Scriptable
 		if camPart then
 			camera.CFrame = camPart.CFrame * CFrame.new(0, 0, state.chaseDistance)
 		else
-			-- Fallback se manca CameraPart: chase generico dietro la nave.
 			local shipPos = state.primary.Position
 			local shipFwd = state.primary.CFrame.LookVector
 			local shipUp  = state.primary.CFrame.UpVector
@@ -1342,180 +1183,199 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	-- Camera recoil + boost FOV: applicati sopra qualsiasi base CFrame scelta.
-	-- Recoil: kick indietro lungo +Z locale (la camera "rincula") + pitch in alto.
-	if state.recoilBack ~= 0 or state.recoilPitch ~= 0 then
-		camera.CFrame = camera.CFrame
-			* CFrame.new(0, 0, state.recoilBack)
-			* CFrame.Angles(state.recoilPitch, 0, 0)
-	end
-
-	-- FOV: boost + hyperdrive allargano. Free cam tiene il BASE_FOV.
-	local boostFov     = (state.boostFactor - 1) / math.max(BOOST_MULTIPLIER - 1, 0.001) * BOOST_FOV_BONUS
-	local hyperFov     = (state.sfoils and state.engineOn) and HYPERDRIVE_FOV_BONUS or 0
-	camera.FieldOfView = BASE_FOV + boostFov + hyperFov
-
 	mouse.TargetFilter = state.ship
 
 	-- ========================================================================
 	-- PHYSICS
 	-- ========================================================================
-	local fwdInput, rgtInput, vertInput = readMoveInput()
+	local fwdInput, rgtInput = readMoveInput()
 	local maxSpeed = math.max(state.config.MaxSpeed, 1)
 
-	-- Motore SPENTO: HUD throttle vuota e velocita' a zero. Salta i body movers.
 	if not state.engineOn then
 		state.currentSpeed = 0
-		HUD.ThrFill.Size = UDim2.new(0, 0, 1, 0)
+		state.flightVel    = Vector3.zero
+		HUD.ThrFill.Size   = UDim2.new(0, 0, 1, 0)
 
-	elseif state.mode == "hover" then
-		-- Movimento WASD relativo al forward piatto della camera; Q/E vertical
-		local camFwd   = camera.CFrame.LookVector
-		local flatFwd  = Vector3.new(camFwd.X, 0, camFwd.Z)
-		if flatFwd.Magnitude < 0.05 then
-			flatFwd = Vector3.new(0, 0, -1)
-		end
-		flatFwd = flatFwd.Unit
-		-- right = forward x up (Roblox: forward (0,0,-1), up (0,1,0) -> right (+1,0,0))
-		local flatRgt = Vector3.new(-flatFwd.Z, 0, flatFwd.X)
-
-		local moveDir = flatFwd * fwdInput + flatRgt * rgtInput
-		local moving  = moveDir.Magnitude > 0.05
-		local hSpeed  = math.min(maxSpeed * HOVER_HORIZ_FACTOR, HOVER_HORIZ_CAP)
-		local horiz   = moving and moveDir.Unit * hSpeed or Vector3.zero
-		local vert    = vertInput * HOVER_VERT_SPEED
-
-		-- Hold posizione (Y=0 mantiene quota contro gravita') quando inerte
-		state.velocity.Velocity = horiz + Vector3.new(0, vert, 0)
-
-		-- Heading: la nave ruota verso la direzione di volo solo quando spingi
-		-- WASD. Senza input mantiene l'ultimo heading (cosi' ti guardi attorno
-		-- liberamente). BodyGyro.CFrame ignora la position, solo la rotazione.
-		-- NOTA: il modello e' costruito col "muso" sul -LookVector del
-		-- PrimaryPart. Per far avanzare il muso allineato a moveDir, il
-		-- LookVector deve puntare al CONTRARIO di moveDir.
-		if moving then
-			state.heldHeading = CFrame.lookAt(Vector3.zero, -moveDir.Unit)
-		end
-		if state.heldHeading then
-			state.gyro.CFrame = state.heldHeading
-		else
-			state.gyro.CFrame = state.primary.CFrame
-		end
-
-		-- Speed display (visivo)
-		state.currentSpeed = state.velocity.Velocity.Magnitude
-
-		-- Throttle bar: forward axis
-		HUD.ThrFill.AnchorPoint = Vector2.new(fwdInput >= 0 and 0 or 1, 0.5)
-		HUD.ThrFill.Position    = UDim2.new(0.5, 0, 0.5, 0)
-		HUD.ThrFill.Size        = UDim2.new(0.5 * math.abs(fwdInput), 0, 1, 0)
-		HUD.ThrFill.BackgroundColor3 = fwdInput >= 0 and PALETTE.primary or PALETTE.accent
-	else
-		-- FLIGHT mode -----------------------------------------------------
-		-- Comportamento "inerziale":
-		--   W  = accelera (la velocita' sale verso fullMax)
-		--   S  = frena   (la velocita' scende verso 0, mai negativa)
-		--   nessuno dei due = mantiene la velocita' corrente (drift)
-		--   Q/E = spinta verticale up/down (solo cruise)
-		--   Shift = boost: moltiplica fullMax per state.boostFactor (drena gauge)
-		--   sfoils ATTIVE = HYPERDRIVE: max speed * HYPERDRIVE_SPEED_MUL
-		local speedMul    = state.sfoils and HYPERDRIVE_SPEED_MUL or CRUISE_SPEED_FACTOR
-		local baseFullMax = maxSpeed * speedMul
-		local fullMax     = baseFullMax * state.boostFactor
-		local accelRate   = maxSpeed * 0.7 * state.boostFactor
-		local brakeRate   = maxSpeed * 1.4
-
-		-- Drain del boost gauge (regen e' gestito fuori dal ramo flight cosi'
-		-- ricarica anche in hover / engine off).
-		if state.boostActive and state.boost > 0 then
-			state.boost = math.max(0, state.boost - BOOST_DRAIN_PER_SEC * dt)
-			if state.boost <= 0 then state.boostActive = false end
-		end
-
+	elseif state.mode == "hangar" then
+		-- ----------------------------------------------------------------
+		-- HANGAR: W/S throttle, A/D yaw piatto, speed cap HANGAR_SPEED
+		-- ----------------------------------------------------------------
 		if fwdInput > 0 then
-			state.currentSpeed = state.currentSpeed + accelRate * dt
+			state.currentSpeed = math.min(state.currentSpeed + HANGAR_ACCEL * dt, HANGAR_SPEED)
 		elseif fwdInput < 0 then
-			state.currentSpeed = state.currentSpeed - brakeRate * dt
-		end
-		state.currentSpeed = math.clamp(state.currentSpeed, 0, fullMax)
-
-		-- Roll: A/D override manuale; senza input, AUTO-BANKING in base alla
-		-- componente laterale dell'aim (la nave si inclina nelle curve come
-		-- nei film).
-		if rgtInput ~= 0 then
-			state.rollAngle = state.rollAngle - rgtInput * 0.18
-			state.rollAngle = math.clamp(state.rollAngle, -1.4, 1.4)
+			state.currentSpeed = math.max(state.currentSpeed - HANGAR_ACCEL * 1.5 * dt, 0)
 		else
-			-- Auto-bank: misura "quanto sto virando" dalla proiezione di aimDir
-			-- sul RightVector della nave. Se aim e' a destra -> bank a destra.
-			local autoTarget = 0
-			if state.camView ~= "free" and state.primary then
-				local mp = mouse.Hit.Position
-				if mouse.Target == nil then
-					mp = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
-				end
-				local aim = (mp - state.primary.Position)
-				if aim.Magnitude > 0.01 then
-					local lateral = aim.Unit:Dot(state.primary.CFrame.RightVector)
-					autoTarget = -math.clamp(lateral, -1, 1) * AUTO_BANK_AMOUNT
-				end
-			end
-			state.rollAngle = state.rollAngle
-				+ (autoTarget - state.rollAngle) * (1 - math.exp(-AUTO_BANK_LERP * dt))
+			state.currentSpeed = math.max(state.currentSpeed - HANGAR_ACCEL * 0.4 * dt, 0)
 		end
 
-		-- Aim verso il cursore in chase. In free cam invece l'heading e'
-		-- BLOCCATO: la nave mantiene la rotazione corrente cosi' il mouse
-		-- e' libero di orbitare la camera senza far virare la nave.
-		local targetCFrame
-		if state.camView == "free" then
-			-- Tieni l'heading attuale (con piccolo lerp che lo agganciera' al
-			-- gyro). Niente roll mentre ti guardi attorno.
-			targetCFrame = state.primary.CFrame
-		else
-			local targetPos = mouse.Hit.Position
-			if mouse.Target == nil then
-				targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
-			end
-			local aimDir     = (targetPos - state.primary.Position).Unit
-			-- Il muso del modello e' sul -LookVector del PrimaryPart, quindi
-			-- il LookVector deve puntare al CONTRARIO del cursore.
-			local baseCFrame = CFrame.lookAt(state.primary.Position, state.primary.Position - aimDir)
-			targetCFrame     = baseCFrame * CFrame.Angles(0, 0, state.rollAngle)
+		state.hangarYaw = state.hangarYaw + rgtInput * HANGAR_TURN_RATE * dt
+
+		-- muso = +LookVector. hangarYaw=0 → muso verso +Z
+		local noseDirFlat = Vector3.new(math.sin(state.hangarYaw), 0, math.cos(state.hangarYaw))
+		if state.gyro then
+			state.gyro.CFrame = CFrame.lookAt(Vector3.zero, noseDirFlat)
+		end
+		if state.velocity then
+			state.velocity.Velocity = noseDirFlat * state.currentSpeed
 		end
 
-		-- Smoothing: il setpoint del gyro si avvicina al target con un lerp
-		-- frame-rate independent (lambda = "velocita' di inseguimento").
-		-- Lambda alto = sterzata reattiva, basso = pesante/elegante.
-		local AIM_LAMBDA = 6
+		local thrPct = state.currentSpeed / HANGAR_SPEED
+		HUD.ThrFill.AnchorPoint      = Vector2.new(0, 0.5)
+		HUD.ThrFill.Position         = UDim2.new(0.5, 0, 0.5, 0)
+		HUD.ThrFill.Size             = UDim2.new(0.5 * thrPct, 0, 1, 0)
+		HUD.ThrFill.BackgroundColor3 = PALETTE.primary
+
+	else
+		-- ----------------------------------------------------------------
+		-- COMBAT: crosshair → yaw/pitch Euler → gyro, auto-bank, deriva
+		-- ----------------------------------------------------------------
+		if fwdInput > 0 then
+			state.currentSpeed = math.min(state.currentSpeed + maxSpeed * 0.7 * dt, maxSpeed)
+		elseif fwdInput < 0 then
+			state.currentSpeed = math.max(state.currentSpeed - maxSpeed * 1.4 * dt, 0)
+		end
+
+		-- Crosshair torna al centro
+		state.crosshairOffset = state.crosshairOffset:Lerp(
+			Vector2.zero, 1 - math.exp(-CROSSHAIR_RETURN * dt)
+		)
+
+		-- Roll manuale A/D (continuo, 360° liberi)
+		state.roll = state.roll - rgtInput * ROLL_RATE * dt
+
+		-- Integra yaw/pitch dal crosshair (X negato: mouse destra → gira destra)
+		local cxNorm = -state.crosshairOffset.X / CROSSHAIR_MAX_R
+		local cyNorm =  state.crosshairOffset.Y / CROSSHAIR_MAX_R
+		local prevAimYaw = state.aimYaw
+		state.aimYaw   = state.aimYaw   + cxNorm * YAW_RATE  * dt
+		state.aimPitch = math.clamp(state.aimPitch - cyNorm * PITCH_RATE * dt, -MAX_PITCH, MAX_PITCH)
+
+		-- Auto-bank proporzionale al yaw rate (si somma al roll manuale)
+		local yawRate    = (state.aimYaw - prevAimYaw) / math.max(dt, 0.001)
+		local targetBank = -(yawRate / YAW_RATE) * BANK_MAX
+		state.bank = state.bank + (targetBank - state.bank) * (1 - math.exp(-BANK_LAMBDA * dt))
+		state.bank = math.clamp(state.bank, -BANK_MAX, BANK_MAX)
+
+		-- Direzione muso dai Euler
+		local cy = math.cos(state.aimYaw)
+		local sy = math.sin(state.aimYaw)
+		local cp = math.cos(state.aimPitch)
+		local sp = math.sin(state.aimPitch)
+		local noseDir = Vector3.new(sy * cp, sp, cy * cp)
+
+		-- Gyro: muso = +LookVector + roll manuale + auto-bank
+		local baseCF    = CFrame.lookAt(Vector3.zero, noseDir)
+		local targetCF  = baseCF * CFrame.Angles(0, 0, state.roll + state.bank)
+		local desiredCF = CFrame.new(state.primary.Position) * (targetCF - targetCF.Position)
+
 		if not state.aimCFrame then
 			state.aimCFrame = state.primary.CFrame
 		end
-		-- Ricostruiamo il CFrame target attorno alla posizione attuale (il
-		-- gyro usa solo la rotazione, ma il Lerp di CFrame interpola anche
-		-- la posizione: la teniamo allineata cosi' il blend e' pulito).
-		local rotOnly = targetCFrame - targetCFrame.Position
-		local desired = CFrame.new(state.primary.Position) * rotOnly
-		state.aimCFrame = state.aimCFrame:Lerp(desired, 1 - math.exp(-AIM_LAMBDA * dt))
-		state.gyro.CFrame = state.aimCFrame
+		state.aimCFrame = state.aimCFrame:Lerp(desiredCF, 1 - math.exp(-AIM_LAMBDA * dt))
+		if state.gyro then
+			state.gyro.CFrame = state.aimCFrame
+		end
 
-		-- Velocita': avanti lungo il muso (-LookVector) + verticale Q/E.
-		local forwardVel = -state.primary.CFrame.LookVector * state.currentSpeed
-		local verticalVel = Vector3.new(0, vertInput * HOVER_VERT_SPEED, 0)
-		state.velocity.Velocity = forwardVel + verticalVel
+		-- Deriva inerziale
+		local targetVel = noseDir * state.currentSpeed
+		state.flightVel = state.flightVel:Lerp(targetVel, 1 - math.exp(-DRIFT_LAMBDA * dt))
+		if state.velocity then
+			state.velocity.Velocity = state.flightVel
+		end
 
-		-- Throttle bar: percentuale della velocita' attuale rispetto al massimo
-		local thrPct = state.currentSpeed / math.max(fullMax, 1)
-		HUD.ThrFill.AnchorPoint = Vector2.new(0, 0.5)
-		HUD.ThrFill.Position    = UDim2.new(0.5, 0, 0.5, 0)
-		HUD.ThrFill.Size        = UDim2.new(0.5 * thrPct, 0, 1, 0)
+		local thrPct = state.currentSpeed / math.max(maxSpeed, 1)
+		HUD.ThrFill.AnchorPoint      = Vector2.new(0, 0.5)
+		HUD.ThrFill.Position         = UDim2.new(0.5, 0, 0.5, 0)
+		HUD.ThrFill.Size             = UDim2.new(0.5 * thrPct, 0, 1, 0)
 		HUD.ThrFill.BackgroundColor3 = PALETTE.primary
+
+		-- ----------------------------------------------------------------
+		-- TARGETING + LEAD INDICATOR
+		-- ----------------------------------------------------------------
+		state.candidateTimer = state.candidateTimer - dt
+		if state.candidateTimer <= 0 then
+			state.candidateTimer = CANDIDATE_REFRESH
+			state.candidates = refreshCandidates(state.config.Faction)
+		end
+
+		-- Muso reale nel mondo (modello rovesciato: muso = -LookVector)
+		local noseWorld = state.primary.CFrame.LookVector
+
+		local newTarget = pickTarget(state.candidates, noseWorld, state.primary.Position)
+		state.target = newTarget
+
+		if state.target then
+			local tRoot = state.target:FindFirstChild("HumanoidRootPart")
+				or state.target:FindFirstChildWhichIsA("BasePart")
+
+			if tRoot then
+				local tPos  = tRoot.Position
+				local tVel  = tRoot.AssemblyLinearVelocity
+				local dist  = (tPos - state.primary.Position).Magnitude
+
+				state.leadWorld  = tPos + tVel * (dist / LASER_SPEED)
+				local leadSP     = worldToScreen(state.leadWorld)
+				state.leadScreen = leadSP
+
+				if leadSP then
+					HUD.LeadIndicator.Visible  = true
+					HUD.LeadIndicator.Position = UDim2.new(0, leadSP.X, 0, leadSP.Y)
+
+					local vpSize   = camera.ViewportSize
+					local center   = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+					state.aligned  = (leadSP - center).Magnitude < ALIGN_TOL_PX
+
+					local aimColor = state.aligned and PALETTE.good or PALETTE.primary
+					HUD.LeadStroke.Color      = aimColor
+					HUD.InnerRingStroke.Color = aimColor
+				else
+					HUD.LeadIndicator.Visible = false
+					HUD.InnerRingStroke.Color = PALETTE.primary
+					state.aligned = false
+				end
+
+				-- Bounding box
+				local minX, minY, maxX, maxY = getModelScreenRect(state.target)
+				if minX then
+					local pad = 6
+					minX = minX - pad; minY = minY - pad
+					maxX = maxX + pad; maxY = maxY + pad
+					local w = maxX - minX
+					local h = maxY - minY
+					HUD.BoxLines[1].Position = UDim2.new(0, minX, 0, minY)
+					HUD.BoxLines[1].Size     = UDim2.new(0, w, 0, 1.5)
+					HUD.BoxLines[2].Position = UDim2.new(0, minX, 0, maxY)
+					HUD.BoxLines[2].Size     = UDim2.new(0, w, 0, 1.5)
+					HUD.BoxLines[3].Position = UDim2.new(0, minX, 0, minY)
+					HUD.BoxLines[3].Size     = UDim2.new(0, 1.5, 0, h)
+					HUD.BoxLines[4].Position = UDim2.new(0, maxX, 0, minY)
+					HUD.BoxLines[4].Size     = UDim2.new(0, 1.5, 0, h)
+					for _, l in ipairs(HUD.BoxLines) do l.Visible = true end
+				else
+					for _, l in ipairs(HUD.BoxLines) do l.Visible = false end
+				end
+			else
+				hideTargetUI()
+				HUD.InnerRingStroke.Color = PALETTE.primary
+			end
+		else
+			hideTargetUI()
+			HUD.InnerRingStroke.Color = PALETTE.primary
+		end
 	end
 
-	-- Replica setpoint al server ~10Hz (backup, se la network ownership zoppica)
+	-- Posizione crosshair UI
+	if state.mode == "combat" and not state.freeLook then
+		local vpSize = camera.ViewportSize
+		HUD.Crosshair.Position = UDim2.new(
+			0, vpSize.X * 0.5 + state.crosshairOffset.X,
+			0, vpSize.Y * 0.5 + state.crosshairOffset.Y
+		)
+	end
+
+	-- Replica setpoint al server ~10Hz
 	replicateAccum = replicateAccum + dt
-	if state.engineOn and replicateAccum >= 0.1 then
+	if state.engineOn and replicateAccum >= 0.1 and state.gyro and state.velocity then
 		replicateAccum = 0
 		ShipEvent:FireServer("DrivePhysics", {
 			CFrame   = state.gyro.CFrame,
@@ -1526,170 +1386,87 @@ RunService.RenderStepped:Connect(function(dt)
 	-- ========================================================================
 	-- HUD UPDATES
 	-- ========================================================================
-	HUD.SpeedValue.Text  = string.format("%d", math.floor(math.abs(state.currentSpeed) + 0.5))
+	HUD.SpeedValue.Text   = string.format("%d", math.floor(math.abs(state.currentSpeed) + 0.5))
 	HUD.SpeedBarFill.Size = UDim2.new(math.clamp(math.abs(state.currentSpeed) / maxSpeed, 0, 1), 0, 1, 0)
 
-	-- Altitude
 	local altY = state.primary.Position.Y
 	HUD.AltValue.Text = string.format("%d", math.floor(altY))
 	local clampedY = math.clamp(altY, -500, 1500)
 	local norm = 1 - (clampedY + 500) / 2000
 	HUD.AltNeedle.Position = UDim2.new(0.5, 0, norm, 0)
 
-	-- Telemetry
 	local look  = state.primary.CFrame.LookVector
 	local right = state.primary.CFrame.RightVector
 	HUD.Pitch.Text   = string.format("%+.0f°", math.deg(math.asin(math.clamp(look.Y, -1, 1))))
 	HUD.Roll.Text    = string.format("%+.0f°", math.deg(math.asin(math.clamp(right.Y, -1, 1))))
 	HUD.Heading.Text = string.format("%03d°",  (math.deg(math.atan2(-look.X, -look.Z)) + 360) % 360)
 
-	-- Mode chip (mostra anche vista cockpit e stato boost)
+	-- Mode chip
 	local newMode
 	if not state.engineOn then
 		newMode = "ENGINE OFF"
 		HUD.ModeChip.BackgroundColor3 = PALETTE.danger
-	elseif state.mode == "hover" then
-		newMode = "HOVER"
-		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
-	elseif state.sfoils then
-		newMode = "HYPERDRIVE"
-		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
+	elseif state.mode == "hangar" then
+		newMode = "HANGAR"
+		HUD.ModeChip.BackgroundColor3 = PALETTE.primaryDim
 	else
-		newMode = "ATTACK"
-		HUD.ModeChip.BackgroundColor3 = PALETTE.primary
-	end
-	if state.mode == "flight" and state.camView == "free" then
-		newMode = newMode .. " · FREE CAM"
-	end
-	if state.boostActive and state.boost > 0 then
-		newMode = newMode .. " · BOOST"
-		HUD.ModeChip.BackgroundColor3 = PALETTE.accent
+		newMode = "COMBAT"
+		HUD.ModeChip.BackgroundColor3 = PALETTE.good
 	end
 	if HUD.ModeLabel.Text ~= newMode then
 		HUD.ModeLabel.Text = newMode
 	end
 
-	-- Boost bar fill + colore (cyan piena, ambra in scarica, rosso a secco)
-	HUD.BoostFill.Size = UDim2.new(math.clamp(state.boost, 0, 1), 0, 1, 0)
-	if state.boost <= 0.001 then
-		HUD.BoostFill.BackgroundColor3 = PALETTE.danger
-	elseif state.boostActive then
-		HUD.BoostFill.BackgroundColor3 = PALETTE.accent
-	else
-		HUD.BoostFill.BackgroundColor3 = PALETTE.primary
-	end
-
-	-- Reticle MOBILE: indica dove sparerai (= dove la nave virera').
-	--   - chase normale  -> posizione del cursore
-	--   - free cam       -> proiezione del muso (centro schermo)
-	--   - hover          -> nascosto (non si spara in hover)
-	--   - hyperdrive     -> nascosto (armi disattivate)
-	--   - lock-on attivo -> nascosto, LeadReticle prende il suo posto
-	if state.mode ~= "flight" or state.sfoils or (state.leadPoint and state.lockedHrp and state.lockedHrp.Parent) then
-		HUD.Reticle.Visible = false
-	else
-		HUD.Reticle.Visible = true
-		if state.camView == "free" then
-			-- muso proiettato a ~1000 studs davanti
-			local muso = state.primary.Position + (-state.primary.CFrame.LookVector) * 1000
-			local sx, sy, on = worldToScreen(muso)
-			if on then
-				HUD.Reticle.Position = UDim2.fromOffset(sx, sy)
-			else
-				HUD.Reticle.Position = UDim2.fromScale(0.5, 0.5)
-			end
-		else
-			-- chase: segui il cursore (GetMouseLocation ignora il GuiInset, OK con IgnoreGuiInset)
-			local m = UserInputService:GetMouseLocation()
-			HUD.Reticle.Position = UDim2.fromOffset(m.X, m.Y)
-		end
-	end
-
-	-- ============ VITALS (shields/hp) =====================================
-	local maxS = state.ship:GetAttribute("MaxShields")    or 100
-	local maxH = state.ship:GetAttribute("MaxHealth")     or 100
-	local curS = state.ship:GetAttribute("CurrentShields") or maxS
-	local curH = state.ship:GetAttribute("CurrentHealth")  or maxH
-	HUD.ShieldsFill.Size = UDim2.new(math.clamp(curS / math.max(maxS, 1), 0, 1), 0, 1, 0)
-	HUD.HealthFill.Size  = UDim2.new(math.clamp(curH / math.max(maxH, 1), 0, 1), 0, 1, 0)
-	-- Colore HP cambia secondo la soglia
-	if curH / math.max(maxH, 1) <= 0.3 then
-		HUD.HealthFill.BackgroundColor3 = PALETTE.danger
-	elseif curH / math.max(maxH, 1) <= 0.6 then
-		HUD.HealthFill.BackgroundColor3 = PALETTE.accent
-	else
-		HUD.HealthFill.BackgroundColor3 = PALETTE.good
-	end
-	-- Flash rosso quando vieni colpito
-	if curS < state.prevShields - 0.01 or curH < state.prevHealth - 0.01 then
-		flashHit()
-	end
-	state.prevShields = curS
-	state.prevHealth  = curH
-
-	-- ============ LOCK-ON =================================================
-	updateLockTracking(dt)
-	if state.lockedHrp and state.lockedHrp.Parent then
-		local tx, ty, on1 = worldToScreen(state.lockedHrp.Position)
-		if on1 then
-			HUD.LockBracket.Visible  = true
-			HUD.LockBracket.Position = UDim2.fromOffset(tx, ty)
-		else
-			HUD.LockBracket.Visible = false
-		end
-		if state.leadPoint then
-			local lx, ly, on2 = worldToScreen(state.leadPoint)
-			if on2 then
-				HUD.LeadReticle.Visible  = true
-				HUD.LeadReticle.Position = UDim2.fromOffset(lx, ly)
-			else
-				HUD.LeadReticle.Visible = false
-			end
-		else
-			HUD.LeadReticle.Visible = false
-		end
-	else
-		HUD.LockBracket.Visible = false
-		HUD.LeadReticle.Visible = false
-	end
+	-- Reticolo visibile solo in combat
+	HUD.Reticle.Visible = (state.mode == "combat")
 end)
 
 -- ============================================================================
--- INPUT
+-- SHOOTING
 -- ============================================================================
 
 local function tryShoot()
 	if not state.ship or not state.primary then return end
-	if state.mode == "hover" then return end  -- in hover non si spara
-	if state.sfoils then return end           -- hyperdrive: armi disattivate
+	if not state.engineOn then return end
+	if state.mode ~= "combat" then return end
+
 	local now = os.clock()
 	if now - state.lastShot < state.config.ReloadSpeed then return end
 	state.lastShot = now
 
-	-- Direzione di tiro:
-	--   1) se lock-on attivo -> verso il lead point (mira predittiva)
-	--   2) free cam          -> lungo il muso
-	--   3) chase normale     -> verso mouse.Hit
-	local dir
-	if state.leadPoint and state.lockedHrp and state.lockedHrp.Parent then
-		dir = (state.leadPoint - state.primary.Position).Unit
-	elseif state.camView == "free" then
-		dir = (-state.primary.CFrame.LookVector).Unit
-	else
-		local targetPos = mouse.Hit.Position
-		if mouse.Target == nil then
-			targetPos = camera.CFrame.Position + (mouse.UnitRay.Direction * 2000)
-		end
-		dir = (targetPos - state.primary.Position).Unit
-	end
-	ShipEvent:FireServer("Shoot", { Direction = dir })
-	pulseRingOnFire()
+	-- Punto di convergenza: lungo il muso, alla distanza del bersaglio
+	local noseWorld = state.primary.CFrame.LookVector
+	local convDist  = DEFAULT_CONV_DIST
 
-	-- Camera recoil: piccola scossa indietro + leggero pitch in alto.
-	-- Si accumula sui colpi rapidi (capped) e decade nel render loop.
-	state.recoilBack  = math.min(state.recoilBack  + RECOIL_KICK_BACK,  RECOIL_MAX_BACK)
-	state.recoilPitch = math.min(state.recoilPitch + RECOIL_KICK_PITCH, RECOIL_MAX_PITCH)
+	if state.target then
+		local tRoot = state.target:FindFirstChild("HumanoidRootPart")
+			or state.target:FindFirstChildWhichIsA("BasePart")
+		if tRoot then
+			convDist = (tRoot.Position - state.primary.Position).Magnitude
+		end
+	end
+
+	local converge = state.primary.Position + noseWorld * convDist
+
+	-- Gimbal assist: se il lead e' entro GIMBAL_TOL_PX dal centro schermo,
+	-- spostiamo il convergence point verso il lead world
+	if state.leadWorld and state.leadScreen then
+		local vpSize = camera.ViewportSize
+		local center = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+		local dist2D = (state.leadScreen - center).Magnitude
+		if dist2D < GIMBAL_TOL_PX then
+			local t = 1 - (dist2D / GIMBAL_TOL_PX)
+			converge = converge:Lerp(state.leadWorld, t)
+		end
+	end
+
+	ShipEvent:FireServer("Shoot", { Converge = converge })
+	pulseRingOnFire()
 end
+
+-- ============================================================================
+-- INPUT
+-- ============================================================================
 
 UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then return end
@@ -1705,68 +1482,40 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		end)
 
 	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-		if state.ship then state.zoomMode = true end
+		if state.ship and state.mode == "combat" then
+			state.zoomMode = true
+		end
 
 	elseif input.KeyCode == Enum.KeyCode.R then
 		if not state.ship then return end
 		state.engineOn = not state.engineOn
 		if not state.engineOn then
 			state.currentSpeed = 0
+			state.flightVel    = Vector3.zero
 		else
-			-- Riaggancia il setpoint del gyro alla posizione corrente cosi'
-			-- non c'e' un "salto" dal vecchio aim al nuovo all'accensione.
 			state.aimCFrame = state.primary and state.primary.CFrame or nil
 		end
 		ShipEvent:FireServer("EngineToggle", { State = state.engineOn })
 
-	elseif input.KeyCode == Enum.KeyCode.Tab then
-		-- Tab cicla i target nemici nel cono frontale (solo in attack, no in hyperdrive).
-		if state.ship and not state.sfoils then cycleLockTarget() end
-
-	elseif input.KeyCode == Enum.KeyCode.V then
-		-- Toggle vista: chase <-> free orbit. Solo in flight (hover ha gia' free orbit).
-		if not state.ship or state.mode ~= "flight" then return end
-		if state.camView == "free" then
-			state.camView = "chase"
-			setMouseLocked(false)
-		else
-			-- Inizializza yaw/pitch dall'orientamento attuale della nave cosi'
-			-- la camera non "salta" entrando in free cam. La nave ha il muso
-			-- sul -LookVector, quindi guardiamo nella direzione opposta.
-			if state.primary then
-				local look = -state.primary.CFrame.LookVector
-				state.freeYaw   = math.atan2(-look.X, -look.Z)
-				state.freePitch = -0.15
-			end
-			state.camView = "free"
-			setMouseLocked(true)
-		end
-
-	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
-		-- Hold Shift = boost (afterburner). Si attiva solo sopra la soglia minima
-		-- e drena finche' tenuto premuto o finche' la gauge si svuota.
-		if not state.ship or state.mode ~= "flight" or not state.engineOn then return end
-		if state.boost >= BOOST_MIN_TO_START then
-			state.boostActive = true
-		end
-
 	elseif input.KeyCode == Enum.KeyCode.N then
 		if not state.ship then return end
-		if state.config.CanHover then
-			-- N alterna hover <-> flight; in flight apriamo le S-foils
-			if state.mode == "hover" then
-				setMode("flight")
-				state.sfoils = true
-				ShipEvent:FireServer("ToggleSfoils", { State = true })
-			else
-				setMode("hover")
-				state.sfoils = false
-				ShipEvent:FireServer("ToggleSfoils", { State = false })
-			end
+		if state.mode == "hangar" then
+			setMode("combat")
+			state.sfoils = true
+			ShipEvent:FireServer("ToggleSfoils", { State = true })
 		else
-			-- Niente hover: N alterna solo le S-foils
-			state.sfoils = not state.sfoils
-			ShipEvent:FireServer("ToggleSfoils", { State = state.sfoils })
+			setMode("hangar")
+			state.sfoils = false
+			ShipEvent:FireServer("ToggleSfoils", { State = false })
+		end
+
+	elseif input.KeyCode == Enum.KeyCode.C then
+		if not state.ship or state.mode ~= "combat" then return end
+		state.freeLook = not state.freeLook
+		if state.freeLook then
+			local look = state.primary.CFrame.LookVector
+			state.hoverYaw   = math.atan2(-look.X, -look.Z)
+			state.hoverPitch = -0.15
 		end
 	end
 end)
@@ -1776,37 +1525,37 @@ UserInputService.InputEnded:Connect(function(input)
 		state.shooting = false
 	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
 		state.zoomMode = false
-	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
-		state.boostActive = false
 	end
 end)
 
 UserInputService.InputChanged:Connect(function(input, processed)
 	if not state.ship then return end
 
-	-- Mouse delta -> orbital camera in hover OR in free cam (entrambe usano
-	-- LockCenter quindi il delta arriva pulito).
 	if input.UserInputType == Enum.UserInputType.MouseMovement then
-		if state.mode == "hover" then
+		local inHangar   = (state.mode == "hangar")
+		local inFreeLook = (state.mode == "combat" and state.freeLook)
+
+		if inHangar or inFreeLook then
+			-- Orbita libera con mouse
 			state.hoverYaw   = state.hoverYaw   - input.Delta.X * 0.005
 			state.hoverPitch = math.clamp(state.hoverPitch - input.Delta.Y * 0.005, -1.45, 1.45)
-			return
-		elseif state.camView == "free" then
-			state.freeYaw   = state.freeYaw   - input.Delta.X * FREE_MOUSE_SENS
-			state.freePitch = math.clamp(state.freePitch - input.Delta.Y * FREE_MOUSE_SENS, -1.45, 1.45)
-			return
+		elseif state.mode == "combat" then
+			-- Deflessione crosshair (X non negato: la negazione avviene in cxNorm)
+			local newOffset = state.crosshairOffset
+				+ Vector2.new(input.Delta.X, input.Delta.Y) * CROSSHAIR_SENS
+			local mag = newOffset.Magnitude
+			if mag > CROSSHAIR_MAX_R then
+				newOffset = newOffset / mag * CROSSHAIR_MAX_R
+			end
+			state.crosshairOffset = newOffset
 		end
+		return
 	end
 
-	-- Mouse wheel: hover -> orbit dist, free -> free dist, chase -> chase dist
 	if input.UserInputType == Enum.UserInputType.MouseWheel then
-		if state.mode == "hover" then
+		if state.mode == "hangar" or (state.mode == "combat" and state.freeLook) then
 			state.hoverDistance = math.clamp(
 				state.hoverDistance - input.Position.Z * 4, MIN_HOVER, MAX_HOVER
-			)
-		elseif state.camView == "free" then
-			state.freeDistance = math.clamp(
-				state.freeDistance - input.Position.Z * 4, FREE_MIN_DIST, FREE_MAX_DIST
 			)
 		else
 			state.chaseDistance = math.clamp(
@@ -1817,7 +1566,7 @@ UserInputService.InputChanged:Connect(function(input, processed)
 end)
 
 -- ============================================================================
--- Quando il personaggio si rispawna, puliamo lo stato.
+-- Respawn: pulizia stato
 -- ============================================================================
 LocalPlayer.CharacterAdded:Connect(function()
 	stopFlight()
