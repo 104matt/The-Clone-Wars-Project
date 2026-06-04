@@ -11,6 +11,7 @@ local UserInputService   = game:GetService("UserInputService")
 local Lighting           = game:GetService("Lighting")
 local TeleportService    = game:GetService("TeleportService")
 local StarterGui         = game:GetService("StarterGui")
+local ContentProvider    = game:GetService("ContentProvider")
 
 -- ============================================================================
 -- DEBUG HELPER  (leave enabled while testing)
@@ -94,6 +95,12 @@ local PANEL_SLIDE_TIME     = 0.60
 local BUTTON_PANEL_GAP     = 0.05      -- short pause between button move and panel slide
 local SCREEN_WIPE_TIME     = 1.20
 local WIPE_STAY_TIME       = 3.00
+
+-- Raid intro (post-team-select): fade-out + StartCam->player camera tween,
+-- timed exactly to ReplicatedStorage.MainMenuRP.IntroSound.TimeLength.
+local RAID_FADE_TIME       = 1.5
+local RAID_PRELOAD_TIMEOUT = 5.0
+local RAID_FALLBACK_TIME   = 13.0
 
 local function buttonCFrame(x, y, z, yawDeg)
 	return CFrame.new(x, y, z) * CFrame.Angles(0, math.rad(yawDeg or -35), 0)
@@ -342,6 +349,18 @@ local function resolveRemotes()
 		StartVoting = r("StartVoting"),
 		MapSelected = r("MapSelected"),
 	}
+end
+
+local function resolveRaidIntroRefs()
+	dbg("REFS", "Resolving raid intro refs (DeactivateUI / IntroSound)...")
+	local mm = ReplicatedStorage:WaitForChild("MainMenuRP", 10)
+	if not mm then dbgErr("REFS", "MainMenuRP missing for raid refs") return nil end
+	local deact = mm:WaitForChild("DeactivateUI", 10)
+	local sound = mm:WaitForChild("IntroSound", 10)
+	if not deact then dbgErr("REFS", "DeactivateUI BoolValue missing") end
+	if not sound then dbgErr("REFS", "IntroSound missing") end
+	if not (deact and sound) then return nil end
+	return { DeactivateUI = deact, IntroSound = sound }
 end
 
 -- ============================================================================
@@ -771,6 +790,156 @@ local function tweenWipe(targetPos, dur)
 		{Position = targetPos})
 	tw:Play()
 	return tw
+end
+
+-- ============================================================================
+-- RAID INTRO FLOW (post-team-select)
+--   Reuses the BlackFrame as the loading overlay. Owns the camera and music
+--   transitions so they cannot race the menu's own handlers.
+-- ============================================================================
+local raidRefs        -- resolved during boot
+local raidIntroActive = false  -- suppresses the lifecycle's resetCameraToPlayer
+
+-- Forward-declare wsRefs so fadeScreenAndSpawn can see it (its `local`
+-- declaration further down in the boot section will reuse this binding).
+local wsRefs
+local wsRefsReady = false
+-- Forward-declare stopMusic (defined later in the boot section) so the
+-- raid intro flow can fade music out without resolving it as a global.
+local stopMusic = function() end
+
+local function freezeLocalCharacter()
+	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	local hum  = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return nil end
+	local saved = {
+		WalkSpeed  = hum.WalkSpeed,
+		JumpPower  = hum.JumpPower,
+		JumpHeight = hum.JumpHeight,
+		AutoRotate = hum.AutoRotate,
+	}
+	hum.WalkSpeed  = 0
+	hum.JumpPower  = 0
+	hum.JumpHeight = 0
+	hum.AutoRotate = false
+	return { humanoid = hum, saved = saved }
+end
+
+local function unfreezeLocalCharacter(freezeState)
+	if not freezeState then return end
+	local hum, saved = freezeState.humanoid, freezeState.saved
+	if not (hum and hum.Parent and saved) then return end
+	hum.WalkSpeed  = saved.WalkSpeed
+	hum.JumpPower  = saved.JumpPower
+	hum.JumpHeight = saved.JumpHeight
+	hum.AutoRotate = saved.AutoRotate
+end
+
+local function resolveSoundDuration(sound)
+	if sound.TimeLength and sound.TimeLength > 0 then return sound.TimeLength end
+	pcall(function() ContentProvider:PreloadAsync({ sound }) end)
+	local elapsed = 0
+	while elapsed < RAID_PRELOAD_TIMEOUT and (not sound.TimeLength or sound.TimeLength <= 0) do
+		task.wait(0.1); elapsed += 0.1
+	end
+	return (sound.TimeLength and sound.TimeLength > 0) and sound.TimeLength or RAID_FALLBACK_TIME
+end
+
+local function computePlayerCameraCFrame()
+	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	local head = char:FindFirstChild("Head")
+		or char:FindFirstChild("HumanoidRootPart")
+		or char:WaitForChild("HumanoidRootPart", 5)
+	if not head then return Camera.CFrame end
+	local subjectPos = head.Position
+	local backDir    = -head.CFrame.LookVector
+	local camPos     = subjectPos + backDir * 12 + Vector3.new(0, 2, 0)
+	return CFrame.lookAt(camPos, subjectPos)
+end
+
+-- Triggers the raid intro from any state (boot with DeactivateUI=true, or
+-- mid-menu when DeactivateUI flips). Disables menu music + menu camera,
+-- parks camera on StartCam, freezes the player, plays IntroSound while
+-- tweening camera StartCam -> player camera over the sound's full length,
+-- then hands camera back and reveals RaidUI.
+--
+-- NOTE: this function does NOT fade any overlay; the caller is responsible
+-- for whatever transition leads into it (the boot loading-screen fade, or
+-- a quick black wipe from the menu).
+local function triggerRaidIntro()
+	if raidIntroActive or _G.__RaidIntroPlayed then return end
+	if not (wsRefs and wsRefs.StartCamPart and raidRefs and raidRefs.IntroSound) then
+		dbgErr("RAID", "Cannot start raid intro – missing wsRefs.StartCamPart or raidRefs")
+		return
+	end
+	raidIntroActive = true
+	_G.__RaidIntroPlayed = true
+	dbg("RAID", "Starting raid intro (StartCam -> player camera)")
+
+	-- Kill the menu music if it's playing.
+	stopMusic()
+
+	-- Stop menu camera idle loop, lock buttons, park camera on StartCam.
+	stopMenuIdleCamera()
+	Camera.CameraType = Enum.CameraType.Scriptable
+	Camera.CFrame     = wsRefs.StartCamPart.CFrame
+
+	-- Hide menu UI for the duration of the raid intro and beyond. The
+	-- lifecycle handler will skip resetCameraToPlayer because
+	-- raidIntroActive is true.
+	local mmGui = script.Parent and script.Parent.Parent
+	if mmGui and mmGui:IsA("ScreenGui") and mmGui.Enabled then
+		mmGui.Enabled = false
+	end
+
+	-- Freeze the player so they can't move during the cinematic.
+	local freezeState = freezeLocalCharacter()
+
+	-- Preload audio and resolve its length.
+	local introSound  = raidRefs.IntroSound:Clone()
+	introSound.Name   = "IntroSound_Active"
+	introSound.Parent = workspace
+	local duration    = resolveSoundDuration(introSound)
+
+	-- Sample camera endpoint once (player is frozen).
+	local startCF = wsRefs.StartCamPart.CFrame
+	local endCF   = computePlayerCameraCFrame()
+
+	-- Audio + camera tween start together.
+	introSound:Play()
+
+	local t0   = tick()
+	local done = false
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		local t = tick() - t0
+		local p = math.clamp(t / duration, 0, 1)
+		Camera.CFrame = startCF:Lerp(endCF, quintEaseOut(p))
+		if p >= 1 and not done then
+			done = true
+			conn:Disconnect()
+		end
+	end)
+	while not done do task.wait() end
+
+	-- Hand camera control back to the player.
+	local char = LocalPlayer.Character
+	local hum  = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		Camera.CameraType    = Enum.CameraType.Custom
+		Camera.CameraSubject = hum
+	end
+
+	unfreezeLocalCharacter(freezeState)
+
+	-- Reveal RaidUI if it exists.
+	local raidUI = PlayerGui:FindFirstChild("RaidUI")
+	if raidUI and raidUI:IsA("ScreenGui") then
+		raidUI.Enabled = true
+	end
+
+	task.delay(0.5, function() if introSound then introSound:Destroy() end end)
+	raidIntroActive = false
 end
 
 local function fadeScreenAndSpawn(MainMenu, remoteCall)
@@ -1231,7 +1400,10 @@ local function ensureMusicPlaying()
 	end
 end
 
-local function stopMusic()
+-- Note: stopMusic is forward-declared near the raid intro flow above, so we
+-- assign to it here rather than re-declaring (otherwise the early reference
+-- in fadeScreenAndSpawn would see a stale no-op).
+stopMusic = function()
 	if menuMusicSound and menuMusicSound.IsPlaying then
 		fadeMusicTo(0)
 		local localSound = menuMusicSound
@@ -1244,16 +1416,30 @@ local function stopMusic()
 	end
 end
 
+-- Resolve raid intro refs NOW so we can decide whether to start the menu
+-- music (if DeactivateUI is already true, we want zero menu music).
+raidRefs = resolveRaidIntroRefs()
+local function isRaidMode()
+	return raidRefs and raidRefs.DeactivateUI and raidRefs.DeactivateUI.Value == true
+end
+
 -- Make sure MainMenu is enabled so any other UI consumers behave correctly.
+-- (When raid mode is active, we leave it disabled — the player should never
+-- see the menu UI in that case.)
 do
 	local mm = script.Parent and script.Parent.Parent
 	if mm and mm:IsA("ScreenGui") then
-		mm.Enabled = true
+		mm.Enabled = not isRaidMode()
 	end
 end
 
--- Kick off menu music NOW (first moment the player enters the game).
-ensureMusicPlaying()
+-- Kick off menu music NOW (first moment the player enters the game), UNLESS
+-- we're in raid mode — the raid intro must run with no background music.
+if not isRaidMode() then
+	ensureMusicPlaying()
+else
+	dbg("BOOT", "DeactivateUI = true at boot; skipping menu music")
+end
 
 -- ============================================================================
 -- UI SOUNDS (hover / click) -- replaces the deleted MenuMusicHandler.lua
@@ -1300,8 +1486,7 @@ end
 
 -- Workspace resolution runs in PARALLEL with the loading screen so the camera
 -- intro can start the instant the loading fade begins (no gap).
-local wsRefs = nil
-local wsRefsReady = false
+-- (wsRefs / wsRefsReady are forward-declared above near the raid intro flow.)
 task.spawn(function()
 	wsRefs = resolveWorkspace()
 	if wsRefs and wsRefs.StartCamPart then
@@ -1333,7 +1518,23 @@ end
 
 -- START CAMERA INTRO IMMEDIATELY (parallel with the loading-screen fade-out
 -- AND with the rest of the heavy setup below).
-if isFirstLoad and wsRefs and wsRefs.StartCamPart and wsRefs.EndCamPart then
+--
+-- Two paths depending on DeactivateUI:
+--   * isRaidMode() == true  -> after the loading screen finishes fading,
+--                              run the raid intro (StartCam -> player camera
+--                              synced to IntroSound). NO menu music, NO
+--                              StartCam->EndCam menu sweep.
+--   * isRaidMode() == false -> normal menu intro (StartCam -> EndCam with
+--                              menu music). Also watch DeactivateUI so a
+--                              later flip still triggers the raid intro.
+if isRaidMode() and wsRefs and wsRefs.StartCamPart then
+	-- The loading screen's fade-out is non-blocking, so by the time we get
+	-- here `runLoadingScreen()` has just kicked it off. Starting the raid
+	-- intro now means the IntroSound + camera tween run *as* the overlay
+	-- fades, instead of after a black gap.
+	dbg("CAM", "Raid mode active – starting raid intro as loading fade begins")
+	task.spawn(triggerRaidIntro)
+elseif isFirstLoad and wsRefs and wsRefs.StartCamPart and wsRefs.EndCamPart then
 	task.spawn(function()
 		dbg("CAM", "Starting camera intro (in parallel with fade and setup)")
 		local ok, err = pcall(playCameraIntro, wsRefs.StartCamPart, wsRefs.EndCamPart)
@@ -1346,6 +1547,17 @@ elseif wsRefs and wsRefs.EndCamPart then
 	-- Returning player: skip intro, go straight to idle camera
 	task.spawn(function()
 		pcall(startMenuIdleCamera, wsRefs.EndCamPart)
+	end)
+end
+
+-- Watch DeactivateUI so a later flip (after the menu is already showing)
+-- also triggers the raid intro instead of leaving the player stuck.
+if raidRefs and raidRefs.DeactivateUI then
+	raidRefs.DeactivateUI:GetPropertyChangedSignal("Value"):Connect(function()
+		if raidRefs.DeactivateUI.Value and not raidIntroActive then
+			dbg("RAID", "DeactivateUI flipped to true – running raid intro")
+			task.spawn(triggerRaidIntro)
+		end
 	end)
 end
 
@@ -1365,7 +1577,8 @@ for _, panel in pairs(PANELS) do
 		panel.Visible = false
 	end
 end
-if MainMenu then MainMenu.Enabled = true end
+-- In raid mode the menu must stay hidden; otherwise enable as usual.
+if MainMenu then MainMenu.Enabled = not isRaidMode() end
 
 dbg("BOOT", "Resolving GameSelectUI...")
 local GameSelectUI, GameSelect, GameSelectMainFrame = resolveGameSelect()
@@ -1426,9 +1639,14 @@ if MainMenu then
 			unlockAllButtons()
 			ensureMusicPlaying() -- resume music when back in menu
 		else
-			dbg("LIFECYCLE", "MainMenu disabled – resetting camera to player")
+			dbg("LIFECYCLE", "MainMenu disabled")
 			lockAllButtons()
-			resetCameraToPlayer()
+			-- During the raid intro, fadeScreenAndSpawn owns the camera
+			-- (parked on StartCam under the black overlay). Resetting it
+			-- here would yank the camera back to the player mid-intro.
+			if not raidIntroActive then
+				resetCameraToPlayer()
+			end
 			stopMusic() -- fade out when leaving menu
 		end
 	end)
